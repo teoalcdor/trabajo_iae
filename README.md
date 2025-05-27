@@ -51,8 +51,7 @@ trabajo_iae.Rproj
 Donde las carpetas de los *datasets* contienen los datos pertinentes y la de plots las gráficas necesarias, que no ponemos por brevedad. De esta forma, podrán ejecutarse todos los ficheros .Rmd sin problema alguno. Estos serán los encargados de la limpieza del *dataset* y el *dashboard*. En cuanto a los ipynb, mientras que plot.ipynb es recomendable correrlo localmente, el resto están adaptados para hacerlo en Google Colab. Estos últimos, que se encargan de la modelización, están adaptados mediante un botón para ser abiertos en la plataforma gratuita ofrecida por Google y conectarse a Google Drive para acceder a los archivos .zip de la carpeta datasets.
 
 ## Obtener el Trabajo
-Podemos encontrar todo el trabajo, con esta estructura en Google Drive, clicando [aquí](https://drive.google.com/drive/folders/1gwd3M8vxaypgw2bO3Bdj91rj349LIYf1?usp=sharing){:target="_blank"}
-. Para copiar toda la carpeta trabajo_iae del enlace a Google Drive particular, basta seguir los siguientes pasos:
+Podemos encontrar todo lo relativo al código del trabajo, incluyendo hojas de estilo y archivos HTML resultantes de compilar los .Rmd de los datos, en este repositorio. Los datos, las gráficas generadas, las imágenes con los diagramas de los modelos y los modelos entrenados en .pth los econtramos en Google Drive, clicando [aquí](https://drive.google.com/drive/folders/1gwd3M8vxaypgw2bO3Bdj91rj349LIYf1?usp=sharing){:target="_blank"}. Para copiar toda la carpeta trabajo_iae del enlace a Google Drive particular, basta seguir los siguientes pasos:
 
 1. **Instala la extensión**  
    Accede al siguiente enlace y haz clic en **"Instalar"**:  
@@ -72,4 +71,4 @@ Podemos encontrar todo el trabajo, con esta estructura en Google Drive, clicando
 
 6. **Espera la confirmación por correo electrónico**  
    La extensión realizará la copia en segundo plano. Una vez completado el proceso, recibirás un correo electrónico notificándote que la copia se ha realizado con éxito.
-
+  
