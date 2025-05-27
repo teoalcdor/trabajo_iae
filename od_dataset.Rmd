@@ -1,0 +1,629 @@
+---
+title: "Limpieza del Dataset de Detección de Objetos"
+author: "Teodoro Alcántara Dormido"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Librerías
+```{r message=FALSE, warning=FALSE}
+library(arrow)
+library(dplyr)
+library(fs)
+library(magick)
+library(magrittr)
+library(purrr)
+library(readr)
+library(stringr)
+```
+
+## Funciones Auxiliares
+```{r}
+is_valid = function(annotation, image){
+  # Nos indica si un par imagen-anotacion es valido
+  
+  # Leemos la informacion de la imagen y extraemos su anchura y altura
+  image_information = image_info(image)
+  w = image_information$width
+  h = image_information$height
+  
+  # Inicializamos los errores
+  errors = rep(FALSE, 4)
+  
+  # Para cada objeto, hacemos las comprobaciones
+  for (i in 1:nrow(annotation)) {
+    line = annotation[i, ]
+    
+    # Vemos si hay 5 campos
+    if (length(line) != 5){
+      errors[1] = TRUE
+      return(list(incorrect_annotation = TRUE, errors = errors))
+    }
+    
+    # Vemos si las etiquetas son validas
+    if (!(line[1] %in% 0:10)) {
+      errors[2] = TRUE
+    }
+    
+    # Vemos si los valores estan normalizados
+    correct_values = all(map_lgl(line[2:5], \(x) 0 <= x & x <= 1))
+    if (correct_values) {
+      x0 = w * line[2]
+      y0 = h * line[3]
+      bbox_w = w * line[4]
+      bbox_h = h * line[5]
+      
+      xmin = x0 - bbox_w * 0.5
+      ymin = y0 - bbox_h * 0.5
+      xmax = x0 + bbox_w * 0.5
+      ymax = y0 + bbox_h * 0.5 
+      
+      # Si los valores estan normalizados, vemos que tengan sentido
+      if (xmin >= xmax || ymin >= ymax) {
+        errors[4] = TRUE
+      }
+    } else {
+      errors[3] = TRUE
+    }
+  }
+  
+  # Vemos si la anotacion esta corrupta
+  corrupt_annotation = any(errors)
+  
+  return(list(corrupt_annotation = corrupt_annotation, errors = errors))
+}
+
+check_annotations = function(annotations_path, images_path) {
+  # Devuelve los pares imagenes-anotacion (solo el nombre sin extension) 
+  # con anotaciones corruptas de un fichero
+  
+  # Inicializamos el dataframe
+  annotations_df = tibble(
+    filename = character(),
+    `Too many attributes` = logical(),
+    `Not valid class` = logical(),
+    `Value out of range` = logical(), 
+    `Incorrect Values` = logical()
+  )
+  
+  # Obtenemos las anotaciones y las imagenes
+  annotation_files = list.files(annotations_path)
+  image_files = list.files(images_path)
+  
+  # Inicializamos la barra de progreso
+  pb = txtProgressBar(min = 1, max = length(annotation_files), initial = 1) 
+  i = 0
+  
+  for (annotation_file in annotation_files) {
+    # Leemos la anotacion
+    annotation = read.table(paste0(annotations_path, annotation_file))
+    
+    # Leemos la imagen como tensor
+    filename = str_remove(annotation_file, "\\.txt$")
+    image_file = str_subset(image_files, str_c(filename, ".(jpg|png)$"))[1]
+    image = image_read(str_c(images_path, image_file))
+    
+    # Validamos la anotacion del objeto
+    annotation_diagnostic = is_valid(annotation, image)
+    
+    # Si la anotacion esta corrupta, la registramos
+    if (annotation_diagnostic$corrupt_annotation) {
+      errors = annotation_diagnostic$errors 
+      annotations_df = annotations_df %>%
+        add_row(
+          filename = filename,
+          `Too many attributes` = errors[1],
+          `Not valid class` = errors[2],
+          `Value out of range` = errors[3], 
+          `Incorrect Values` = errors[4]
+        )
+    }
+    
+    # Actualizamos la barra de progreso
+    i = i + 1
+    setTxtProgressBar(pb,i)
+    
+  }
+  
+  # Cerramos la barra de progreso
+  close(pb)
+  
+  # Imprimimos algunas estadisticas
+  n_corrupt = nrow(annotations_df)
+  n_annotations = length(annotation_files)
+  
+  print(str_c(
+    " - Numero de Anotaciones Corruptas: ", n_corrupt, " de ", n_annotations 
+  ))
+  print(str_c(" - Demasiados atributos: ", sum(annotations_df$`Too many attributes`)))
+  print(str_c(" - Clase no válida: ", sum(annotations_df$`Not valid class`)))
+  print(str_c(" - Valor fuera de rango: ", sum(annotations_df$`Value out of range`)))
+  print(str_c(" - Valores Incorrectos: ", sum(annotations_df$`Incorrect Values`)))
+
+  return(annotations_df)
+}
+
+find_image = function(folder_path, filename) {
+  # Encuentra una imagen con el nombre sin extension (suponiendo imagenes en JPG
+  # o en PNG)
+  
+  for (extension in c(".png", ".jpg")){
+    image_path = str_c(folder_path, filename, extension)
+    if (file_exists(image_path)) {
+      return(str_c(filename, extension))
+    }
+  }
+}
+
+move_images = function(filenames, path_from, path_to) {
+  # Mueve las imagenes de un lugar a otro a partir de su nombre sin extension
+  
+  # Inicializamos la barra de progreso
+  pb = txtProgressBar(min = 1, max = length(filenames), initial = 1) 
+  it = 0
+  
+  for (filename in filenames) {
+    image = find_image(path_from, filename)
+    file_move(
+      str_c(path_from, image),
+      str_c(path_to, image)
+    )
+    
+    # Actualizamos la barra de progreso
+    it = it + 1
+    setTxtProgressBar(pb,it)
+  }
+  
+  # Cerramos la barra de progreso
+  close(pb)
+}
+
+move_annotations = function(filenames, path_from, path_to) {
+  # Mueve las anotaciones de un lugar a otro a partir de su nombre sin extension
+  
+  # Inicializamos la barra de progreso
+  pb = txtProgressBar(min = 1, max = length(filenames), initial = 1) 
+  it = 0
+  
+  for (filename in filenames) {
+    file_move(
+      str_c(path_from, filename, ".txt"),
+      str_c(path_to, filename, ".txt")
+    )
+    
+    # Actualizamos la barra de progreso
+    it = it + 1
+    setTxtProgressBar(pb,it)
+  }
+  
+  # Cerramos la barra de progreso
+  close(pb)
+}
+
+darknet2pascalvoc = function(annotations_path, images_path) {
+  # Crea un dataframe donde, a partir de las anotacion Darknet, para cada 
+  # objeto tenemos su imagen y anotacion en PascalVOC
+  
+  # Inicializamos el dataset de las anotaciones
+  annotations_df = tibble(
+    image = character(), # Imagen con extension
+    class = integer(),
+    xmin = integer(),
+    ymin = integer(), 
+    xmax = integer(),
+    ymax = integer()
+  )
+  
+  # Seleccionamos las anotaciones y nombres de fichero
+  annotations = list.files(annotations_path, full.names = FALSE)
+  filenames = str_remove(annotations, "\\.txt$")
+  
+  # Inicializamos la barra de progreso
+  pb = txtProgressBar(min = 1, max = length(annotations), initial = 1) 
+  it = 0
+  
+  for (filename in filenames) {
+    
+    # Encontramos la imagen correspondiente
+    image = find_image(images_path, filename)
+    
+    # Elaboramos el path a la imagen y anotacion
+    annotation_path = str_c(annotations_path, "/", filename, ".txt")
+    image_path = str_c(images_path, "/", image)
+    
+    # Leemos la imagen y extraemos su anchura y altura
+    img = image_read(image_path)
+    img_information = image_info(img)
+    w = img_information$width
+    h = img_information$height
+    
+    # Extraemos la tabla con a anotacion
+    annotation_table = read.table(annotation_path)
+    
+    for (i in 1:nrow(annotation_table)) { # Para cada objeto, transformamos
+      line = annotation_table[i, ]
+      x0 = w * line[2]
+      y0 = h * line[3]
+      bbox_w = w * line[4]
+      bbox_h = h * line[5]
+      
+      xmin = x0 - bbox_w * 0.5
+      ymin = y0 - bbox_h * 0.5
+      xmax = x0 + bbox_w * 0.5
+      ymax = y0 + bbox_h * 0.5 
+      
+      # Cuando trabajemos con torchvision no nos podemos salir de la imagen
+      if (xmin < 0){
+        xmin = 0
+      }
+      if (ymin < 0){
+        ymin = 0
+      }
+      if (xmax > w){
+        xmax = w
+      } 
+      if (ymax > h){
+        ymax = h
+      }
+      
+      # Guardamos la anotacion transformada en un dataframe
+      annotations_df =  annotations_df %>%
+        add_row(
+            image = image,
+            class = as.integer(line[1]),
+            xmin = as.integer(xmin),
+            ymin = as.integer(ymin),
+            xmax = as.integer(xmax), 
+            ymax = as.integer(ymax)
+          )
+    }
+    
+    # Actualizamos la barra de progreso
+    it = it + 1
+    setTxtProgressBar(pb,it)
+  } 
+  
+  # Cerramos la barra de progreso
+  close(pb)
+
+  return(annotations_df)
+}
+
+create_dataframe_darknet = function(annotations_path) {
+  # Crea un dataframe con las anotacion Darknet de cada objeto
+  
+  # Inicializamos el dataframe con las anotaciones
+  annotations_df = tibble(
+    image = character(), 
+    class = integer(),
+    x0 = numeric(),
+    y0 = numeric(), 
+    w = numeric(),
+    h = numeric()
+  )
+  
+  # Obtenemos las anotaciones
+  annotations = list.files(annotations_path, full.names = FALSE)
+  
+  # Inicializamos la barra de progreso
+  pb = txtProgressBar(min = 1, max = length(annotations), initial = 1) 
+  it = 0
+  
+  for (annotation in annotations) {
+    
+    # Obtenemos la tabla correspondiente a la anotacion
+    annotation_path = str_c(annotations_path, annotation)
+    annotation_table = read.table(annotation_path)
+    
+    for (i in 1:nrow(annotation_table)) { # Guardamos cada objeto
+      line = annotation_table[i, ]
+      
+      annotations_df = annotations_df %>%
+        add_row(
+            image = str_remove(annotation, "\\.txt$"),
+            class = as.integer(line[1]),
+            x0 = as.numeric(line[2]),
+            y0 = as.numeric(line[3]),
+            w = as.numeric(line[4]), 
+            h = as.numeric(line[5])
+          )
+    }
+    
+    # Actualizamos la barra de progreso
+    it = it + 1
+    setTxtProgressBar(pb,it)
+  }
+  
+  # Cerramos la barra de progreso
+  close(pb)
+  
+  return(annotations_df)
+}
+```
+
+## Validación
+Comprobamos que todas la imágenes estén en JPG o PNG, como vimos se supone que han de estar:
+```{r}
+train_images = list.files("datasets/od_dataset/images/train", full.names = FALSE)
+val_images = list.files("datasets/od_dataset/images/val", full.names = FALSE)
+test_images = list.files("datasets/od_dataset/images/test", full.names = FALSE)
+
+n_train_images = length(train_images)
+n_val_images = length(val_images)
+n_test_images = length(test_images)
+
+train_images %>%
+  tibble(image = .) %>%
+  filter(!(str_ends(image, ".jpg")) & !(str_ends(image, ".png"))) %>%
+  nrow() %>%
+  {print(str_c("Numero de imágenes ni en JPG ni en PNG en entrenamiento: ", .))}
+val_images %>%
+  tibble(image = .) %>%
+  filter(!(str_ends(image, ".jpg")) & !(str_ends(image, ".png"))) %>%
+  nrow() %>%
+  {print(str_c("Numero de imágenes ni en JPG ni en PNG en validación: ", .))}
+test_images %>%
+  tibble(image = .) %>%
+  filter(!(str_ends(image, ".jpg")) & !(str_ends(image, ".png"))) %>%
+  nrow() %>%
+  {print(str_c("Numero de imágenes ni en JPG ni en PNG en test: ", .))}
+```
+Vemos que tenemos 0 imágenes en cada subconjunto que estén en un formato incorrecto. Ahora comprobamos que todas las anotaciones estén en TXT:
+```{r}
+train_annotations = list.files("datasets/od_dataset/labels/train", 
+                               full.names = FALSE)
+val_annotations = list.files("datasets/od_dataset/labels/val", 
+                             full.names = FALSE)
+test_annotations = list.files("datasets/od_dataset/labels/test", 
+                              full.names = FALSE)
+
+n_train_annotations = length(train_annotations)
+n_val_annotations = length(val_annotations)
+n_test_annotations = length(test_annotations)
+
+train_annotations %>%
+  tibble(annotation = .) %>%
+  filter(!(str_ends(annotation, ".txt"))) %>%
+  nrow() %>%
+  {print(str_c("Numero de anotaciones no en TXT en entrenamiento: ", .))}
+val_annotations %>%
+  tibble(annotation = .) %>%
+  filter(!(str_ends(annotation, ".txt"))) %>%
+  nrow() %>%
+  {print(str_c("Numero de anotaciones no en TXT en validación: ", .))}
+test_annotations %>%
+  tibble(annotation = .) %>%
+  filter(!(str_ends(annotation, ".txt"))) %>%
+  nrow() %>%
+  {print(str_c("Numero de anotaciones no en TXT en test: ", .))}
+```
+Todas las anotaciones están en un formato correcto.  
+Es esencial que casen anotaciones e imágenes. Comenzamos comprobando que, en cada subconjunto, tenemos tantas anotaciones como imágenes:
+```{r}
+if (n_train_images == n_train_annotations) {
+  print("Hay tantas imágenes como anotaciones en entrenamiento.")
+} else {
+  print("Hay diferente número de imágenes y anotaciones en entrenamiento.")
+}
+
+if (n_val_images == n_val_annotations) {
+  print("Hay tantas imágenes como anotaciones en validación.")
+} else {
+  print("Hay diferente número de imágenes y anotaciones en validación.")
+}
+
+if (n_test_images == n_test_annotations) {
+  print("Hay tantas imágenes como anotaciones en test.")
+} else {
+  print("Hay diferente número de imágenes y anotaciones en test.")
+}
+```
+
+Vemos ahora si estas coinciden o no para cada subconjunto:
+```{r}
+# Para el conjunto de entrenamiento
+equal_train = tibble(train_images, train_annotations) %>%
+  mutate( # Eliminamos las extensiones y ordenamos
+    image_name = sort(str_remove(train_images, "\\.(jpg|png)$")),
+    annotation_name = sort(str_remove(train_annotations, "\\.txt$"))
+  ) %$% # Para poner .x e .y
+  map2_lgl( # Ambas columnas sin extensiones y ordenadas deben coincidir
+    .x = image_name,
+    .y = annotation_name,
+    \(x, y) x == y
+  ) %>%
+  all()
+
+# Para el conjunto de validacion
+equal_val = tibble(val_images, val_annotations) %>%
+  mutate( # Eliminamos las extensiones y ordenamos
+    image_name = sort(str_remove(val_images, "\\.(jpg|png)$")),
+    annotation_name = sort(str_remove(val_annotations, "\\.txt$"))
+  ) %$% # Para poner .x e .y
+  map2_lgl( # Ambas columnas sin extensiones y ordenadas deben coincidir
+    .x = image_name,
+    .y = annotation_name,
+    \(x, y) x == y
+  ) %>%
+  all()
+
+# Para el conjunto test
+equal_test = tibble(test_images, test_annotations) %>%
+  mutate(  # Eliminamos las extensiones y ordenamos
+    image_name = sort(str_remove(test_images, "\\.(jpg|png)$")),
+    annotation_name = sort(str_remove(test_annotations, "\\.txt$"))
+  ) %$% # Para poner .x e .y
+  map2_lgl( # Ambas columnas sin extensiones y ordenadas deben coincidir
+    .x = image_name,
+    .y = annotation_name,
+    \(x, y) x == y
+  ) %>%
+  all()
+
+if (equal_train) {
+  print("En entrenamiento, hay una imagen para cada anotación y una anotación para cada imagen.")
+} else {
+  print("En entrenamiento, imagenes y anotaciones no coinciden.")
+}
+
+if (equal_val) {
+  print("En validación, hay una imagen para cada anotación y una anotación para cada imagen.")
+} else {
+  print("En validación, imagenes y anotaciones no coinciden.")
+}
+
+if (equal_test) {
+  print("En test, hay una imagen para cada anotación y una anotación para cada imagen.")
+} else {
+  print("En test, imagenes y anotaciones no coinciden.")
+}
+```
+
+Vemos cuántas y cuáles anotaciones están corruptas en cada subconjunto:
+```{r}
+corrupt_annotations_train = check_annotations(
+  "datasets/od_dataset/labels/train/",
+  "datasets/od_dataset/images/train/"
+)
+corrupt_annotations_val = check_annotations(
+  "datasets/od_dataset/labels/val/",
+  "datasets/od_dataset/images/val/"
+)
+corrupt_annotations_test = check_annotations(
+  "datasets/od_dataset/labels/test/",
+  "datasets/od_dataset/images/test/"
+)
+```
+Vemos que todas las anotaciones corruptas tienen los valores mal normalizados. Por desgracia, solo podemos eliminarlas del dataset y reanotarlas. Por falta de tiempo, no las reanotaremos, pero sí las conservamos para hacerlo en un futuro mediante herramientas como RoboFlow.
+
+# Creación de un Conjunto de Datos Limpio y Otro de Anotaciones Corruptas
+Copiamos nuestro conjunto original, creando la base del conjunto limpio:
+```{r}
+dir_copy(
+    "datasets/od_dataset",
+    "datasets/od_dataset_clean"
+)
+```
+
+Creamos la estructura del conjunto con anotaciones corruptas:
+```{r}
+dir_create("datasets/corrupt_od_dataset")
+dir_create("datasets/corrupt_od_dataset/images")
+dir_create("datasets/corrupt_od_dataset/images/train")
+dir_create("datasets/corrupt_od_dataset/images/val")
+dir_create("datasets/corrupt_od_dataset/images/test")
+dir_create("datasets/corrupt_od_dataset/labels")
+dir_create("datasets/corrupt_od_dataset/labels/train")
+dir_create("datasets/corrupt_od_dataset/labels/val")
+dir_create("datasets/corrupt_od_dataset/labels/test")
+```
+
+Movemos las imágenes con anotaciones corruptas del conjunto limpio a su propio conjunto:
+```{r}
+# Conjunto de entrenamiento
+move_images(
+    corrupt_annotations_train["filename"]$filename,
+    "datasets/od_dataset_clean/images/train/",
+    "datasets/corrupt_od_dataset/images/train/"
+)
+move_annotations(
+    corrupt_annotations_train["filename"]$filename,
+    "datasets/od_dataset_clean/labels/train/",
+    "datasets/corrupt_od_dataset/labels/train/"
+)
+
+# Conjunto de validación
+move_images(
+    corrupt_annotations_val["filename"]$filename,
+    "datasets/od_dataset_clean/images/val/",
+    "datasets/corrupt_od_dataset/images/val/"
+)
+move_annotations(
+    corrupt_annotations_val["filename"]$filename,
+    "datasets/od_dataset_clean/labels/val/",
+    "datasets/corrupt_od_dataset/labels/val/"
+)
+
+# Conjunto test
+move_images(
+    corrupt_annotations_test["filename"]$filename,
+    "datasets/od_dataset_clean/images/test/",
+    "datasets/corrupt_od_dataset/images/test/"
+)
+move_annotations(
+    corrupt_annotations_test["filename"]$filename,
+    "datasets/od_dataset_clean/labels/test/",
+    "datasets/corrupt_od_dataset/labels/test/"
+)
+```
+
+## Obtención de las Anotaciones en Formato Dataframe y Exportación
+```{r}
+dir_create("datasets/od_dataset_df")
+```
+
+
+### Darknet
+```{r}
+od_dataset_dn_train = create_dataframe_darknet(
+  "datasets/od_dataset_clean/labels/train/"
+)
+od_dataset_dn_val = create_dataframe_darknet(
+  "datasets/od_dataset_clean/labels/val/"
+)
+od_dataset_dn_test = create_dataframe_darknet(
+  "datasets/od_dataset_clean/labels/test/"
+)
+```
+
+Guardamos como feather:
+```{r}
+write_feather(
+  od_dataset_dn_train,
+  "datasets/od_dataset_df/od_dataset_dn_train.feather"
+)
+write_feather(
+  od_dataset_dn_val,
+  "datasets/od_dataset_df/od_dataset_dn_val.feather"
+)
+write_feather(
+  od_dataset_dn_test,
+  "datasets/od_dataset_df/od_dataset_dn_test.feather"
+)
+```
+
+
+### PascalVOC
+```{r}
+od_dataset_pv_train = darknet2pascalvoc(
+  "datasets/od_dataset_clean/labels/train/",
+  "datasets/od_dataset_clean/images/train/"
+)
+od_dataset_pv_val = darknet2pascalvoc(
+  "datasets/od_dataset_clean/labels/val/",
+  "datasets/od_dataset_clean/images/val/"
+)
+od_dataset_pv_test = darknet2pascalvoc(
+  "datasets/od_dataset_clean/labels/test/",
+  "datasets/od_dataset_clean/images/test/"
+)
+```
+
+Guardamos como feather:
+```{r}
+write_feather(
+  od_dataset_pv_train,
+  "datasets/od_dataset_df/od_dataset_pv_train.feather"
+)
+write_feather(
+  od_dataset_pv_val,
+  "datasets/od_dataset_df/od_dataset_pv_val.feather"
+)
+write_feather(
+  od_dataset_pv_test,
+  "datasets/od_dataset_df/od_dataset_pv_test.feather"
+)
+```

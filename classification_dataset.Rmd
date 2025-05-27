@@ -1,0 +1,275 @@
+---
+title: "Creación y Limpieza del Dataset de Clasificación"
+author: "Teodoro Alcántara Dormido"
+date: "2025-04-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Librerías
+```{r message=FALSE, warning=FALSE}
+library(dplyr)
+library(fs)
+library(magick)
+library(magrittr)
+library(purrr)
+library(readr)
+library(reticulate)
+library(stringr)
+```
+
+Usamos un entorno virtual en el que tenemos las librerías de Python ya instaladas:
+```{r}
+use_virtualenv("envs/trabajo_iae_env", required = TRUE)
+```
+
+```{python}
+import random
+import torch
+import cv2
+import pandas as pd
+from torchvision import transforms
+import tqdm
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+```
+
+## Validación de Datos
+Importamos las etiquetas de entrenamiento y validación (que en el conjunto llaman test) del conjunto de detección de objetos original.
+```{r}
+train_labels = read_csv("datasets/od_dataset_classification/Labels/train_labels.csv")
+test_labels = read_csv("datasets/od_dataset_classification/Labels/test_labels.csv")
+```
+
+Vemos, primero, qué imágenes están en las dataframes pero no en las imágenes, y luego, que imágenes están están en la carpeta correspondiente pero no en los dataframes.
+```{r}
+# Seleccionamos todas las imagenes
+all_images_tb = tibble(
+  filename = list.files("datasets/od_dataset_classification/Images/")
+)
+
+# Vemos que imagenes estan en los dataframes pero no en la carpeta de imagenes
+anti_labels = train_labels %>%
+  union(test_labels) %>%
+  select(filename) %>%
+  anti_join(all_images_tb, by = join_by(filename))
+
+# Vemos que imagenes estan en la carpeta de imagenes pero no en los dataframes
+anti_images = all_images_tb %>%
+  anti_join(union(train_labels, test_labels), by = join_by(filename))
+
+print(str_c("Hay ", nrow(anti_labels), " imagenes en los dataframes que no estan en la carpeta de imágenes."))
+print(str_c("Hay ", nrow(anti_images), " imagenes en la carpeta de imágenes que no estan en los dataframes."))
+
+```
+Nos quedamos en el dataframe solo con las imagenes que existen en la carpeta de imagenes:
+```{r}
+clean_train_labels = train_labels %>%
+  filter(!(filename %in% anti_labels$filename))
+clean_test_labels = test_labels %>% 
+  filter(!(filename %in% anti_labels$filename))
+```
+
+Vamos a quedarnos solo con las imagenes de entrenamiento con un unico objeto. Estas imágenes estarán etiquetadas con la clase del objeto.
+```{r}
+train_labels_classification = clean_train_labels %>%
+  group_by(filename) %>%
+  summarise(
+    objects = n(),
+    object_class = first(class)
+  ) %>%
+  filter(objects == 1) %>%
+  select(-objects)
+
+train_labels_classification
+```
+
+Vamos a quedarnos solo con las imagenes de validación con un unico objeto. Estas imágenes, de nuevo, estarán etiquetadas con la clase del objeto.
+```{r}
+test_labels_classification = clean_test_labels %>%
+  group_by(filename) %>%
+  summarise(
+    objects = n(),
+    object_class = first(class)
+  ) %>%
+  filter(objects == 1) %>%
+  select(-objects)
+
+test_labels_classification
+```
+
+Hemos apreciado que existe intersección entre los dos subconjuntos. Veammos cuántas imágenes de intersección hay:
+```{r}
+intersect_images = train_labels_classification %>% 
+  inner_join( # Usamos un inner join, para retener las clases de ambos subcjtos
+    test_labels_classification, 
+    by = "filename", 
+    suffix = c("_train", "_test")
+  ) 
+
+intersect_images
+```
+Parece ser que todas las imágenes que están en validación también están en entrenamiento. Veamos si, además, tienen también las mismas clases (las anotaciones en el conjunto de datos de detección original coinciden). Comenzamos viendo que, efectivamente, el conjunto de validación es igual a la intersección.
+```{r}
+if (all(intersect_images$filename == test_labels_classification$filename)) {
+  print("Los conjuntos coinciden.")
+} else {
+  print("Los conjuntos no coinciden.")
+}
+```
+Vemos ahora si coinciden las clases en entrenamiento y validación o no:
+```{r}
+coinciden = intersect_images %>%
+  {
+    reduce2(
+      .x = .$object_class_train,
+      .y = .$object_class_test,
+      .init = TRUE,
+      .f = \(acc, x, y) acc & (x == y)
+    )
+  }
+
+if (coinciden) {
+  print("Las clases coinciden.")
+} else {
+  print("Las clases no coinciden.")
+}
+```
+Como las clases coinciden, eso significa que el conjunto de validación no aporta nada, por lo que nuestro conjunto de entrenamiento pasa a ser el del dataset que vamos a construir entero:
+```{r}
+image_labels_classification = train_labels_classification
+```
+
+## Creación del Dataset
+Codificamos las clases (usamos python para obtener resultados similares a los del TFG):
+```{python}
+classes = r.image_labels_classification["object_class"].unique()
+label_encoder = LabelEncoder()
+label_encoder.fit(classes)
+```
+
+Modificamos las clases para convertirlas en etiquetas en el dataframe (usamos python para obtener resultados similares a los del TFG):
+```{python}
+image_labels_classification = r.image_labels_classification
+image_labels_classification["object_class"] = label_encoder.transform(r.image_labels_classification["object_class"])
+image_labels_classification["object_class"].unique()
+r.image_labels_classification = image_labels_classification
+```
+Fijamos la semilla para que todo sea reproducible
+```{python}
+SEED = 123
+```
+
+Hacemos la división en entrenamiento y validación (usamos python para obtener resultados similares a los del TFG):
+```{python}
+train_labels, val_labels = train_test_split(
+    image_labels_classification,
+    test_size=0.2,
+    random_state=SEED,
+    stratify=image_labels_classification["object_class"]
+)
+
+r.train_labels = train_labels 
+r.val_labels = val_labels
+``` 
+
+Creamos la carpeta con el conjunto de datos y los CSV con las imágenes para entrenamiento y validación:
+```{r}
+dir_create("datasets/classification_dataset")
+dir_create("datasets/classification_dataset/images")
+
+write_csv(train_labels, "datasets/classification_dataset/train_labels.csv")
+write_csv(val_labels, "datasets/classification_dataset/val_labels.csv")
+```
+
+Copiamos las imagenes que vamos a usar a la carpeta creada:
+```{r}
+for (filename in image_labels_classification$filename) {
+  file_copy(
+    str_c("datasets/od_dataset_classification/Images/", filename),
+    str_c("datasets/classification_dataset/images/", filename)
+  )
+}
+```
+
+Copiamos nuestro conjunto de clasificación para obtener el conjuno al que haremos las augmentations. Borramos las etiquetas de entrenamiento, ya que necesitaremos una versión extendida de las mismas que incluya las imágenes con augmentations:
+```{r}
+dir_copy("datasets/classification_dataset", "datasets/classification_dataset_augmented")
+file_delete("datasets/classification_dataset_augmented/train_labels.csv")
+```
+
+Definimos nuestra transformación para la data augmentation:
+```{python}
+aug_transform = transforms.Compose([
+    transforms.ToPILImage(), # Pasamos la imagen a formato PIL
+    transforms.RandomChoice([
+        transforms.GaussianBlur(kernel_size=25, sigma=(10.0, 20.0)), # Difumina
+        transforms.ColorJitter( # Cambia el color
+            brightness=(0.5,1.5),
+            contrast=(0.8,1.2),
+            saturation=(0.8,1.2),
+            hue=0.25
+        )
+    ]),
+    transforms.RandomAffine(5, translate=(0.01, 0.1)), # Transformacion Afin
+    transforms.RandomHorizontalFlip(p=0.85), # Reflexion horizontal
+    transforms.RandomVerticalFlip(p=0.01), # Reflexion vertical
+    transforms.RandomPerspective(distortion_scale=0.15, p=0.2), # Perspectiva
+    transforms.RandomGrayscale(p=0.1), # Cambio a escala de grises
+    transforms.ToTensor(), # Pasamos a tensor de Pytorch y normalizamos en [0,1]
+    transforms.RandomErasing(p=0.1, scale=(0.01, 0.1)) # Borramos un cuadrado
+])
+```
+
+Realizamos la data augmentation de forma reproducible:
+```{python}
+# Por reproducibilidad, inicializamos las semillas
+SEED = 123
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+random.seed(SEED)
+np.random.seed(SEED)
+
+# Inicialiamos las semillas
+augmented_train_labels = train_labels.copy()
+augmented_train_labels.reset_index(drop=True, inplace=True)
+n_ = train_labels.shape[0]
+
+list_destination_filenames = train_labels["filename"].values
+
+for filename in tqdm.tqdm(list_destination_filenames, total=n_):
+    # Leemos la imagen en RGB
+    img = cv2.imread(f"datasets/classification_dataset/images/{filename}")
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    
+    # Realizamos la augmentation y la pasamos a BGR para guardarla
+    img_aug = aug_transform(img)
+    img_aug = cv2.cvtColor(
+      (img_aug.permute(1,2,0).numpy() * 255).astype(np.uint8),
+      cv2.COLOR_RGB2BGR
+    )
+
+    # Guardamos la imagen augmentada
+    name = filename[:-4]
+    extension = filename[-4:]
+    destination_name = name + "_augmented"
+    
+    while destination_name + extension in list_destination_filenames:
+        destination_name += "_augmented"
+
+    _ = cv2.imwrite(f"datasets/classification_dataset_augmented/images/{destination_name}.jpg",
+                        img_aug)
+  
+    # Actualizamos el dataframe con la imagen augmentada
+    augmented_train_labels.loc[len(augmented_train_labels)] = [
+        f"{destination_name}.jpg",
+        train_labels.loc[train_labels["filename"] == f"{name}.jpg"]["object_class"].values[0]
+    ]
+
+augmented_train_labels.to_csv("datasets/classification_dataset_augmented/train_labels.csv", index=False)
+```
+

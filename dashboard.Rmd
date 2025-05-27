@@ -1,0 +1,1421 @@
+---
+title: "Visión por Computador Aplicada al Ámbito Militar"
+output:
+  flexdashboard::flex_dashboard:
+      orientation: rows
+      vertical_layout: fill
+      css: estilo/layout.css
+      theme: yeti
+      runtime: shiny
+---
+
+
+```{r global_options, echo=FALSE, cache=FALSE}
+knitr::opts_chunk$set(fig.width = NULL, fig.height = NULL)
+```
+
+```{r include=FALSE}
+library(tidyverse) 
+library(flexdashboard)
+library(reticulate)
+library(DT)
+library(arrow)
+use_virtualenv("envs/trabajo_iae_env", required = TRUE)
+```
+
+```{python echo=FALSE}
+import random
+import torch
+import cv2
+import pandas as pd
+import numpy as np
+from torchvision import transforms
+from torchvision.models import vgg19, VGG19_Weights
+from torchvision.models.detection.ssd import SSDHead
+from torchvision.models.detection import ssd300_vgg16, SSD300_VGG16_Weights
+import torch.nn as nn
+from sklearn.preprocessing import LabelEncoder
+from ultralytics import YOLO
+from torchvision.ops import nms
+from torchvision.models import vgg16_bn, VGG16_BN_Weights
+import matplotlib.pyplot as plt
+```
+
+```{python include=FALSE}
+DEVICE = "cpu" 
+```
+
+```{python include=FALSE}
+label_encoder_classification = LabelEncoder()
+label_encoder_classification.classes_ = np.array([
+    'civilian aircraft',
+    'civilian car',
+    'military aircraft',
+    'military helicopter',
+    'military tank',
+    'military truck'
+])
+
+standard_transform_classification = transforms.Compose([
+    transforms.ToPILImage(),
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+])
+
+def collate_fn_classification(batch, transform=standard_transform_classification):
+    images, targets = tuple(zip(*batch))
+
+    if transform is not None:
+        images = [transform(image)[None] for image in images]
+
+    images = torch.cat(images, dim=0)
+    targets = torch.tensor(targets).long()
+    return images.to(DEVICE), targets.to(DEVICE)
+
+def get_model_vgg19(num_classes):
+    """
+    Nos permite obtener un modelo VGG19 listo para aplicar fine tuning y transfer learning, 
+    su optimizador (Adam) y la funcion de pérdiad d entropía cruzada.
+    """
+    
+    # Obtenemos el modelo pre-entrenado
+    model = vgg19(weights=VGG19_Weights.DEFAULT)
+
+    # Congelamos todos los parametros de la parte convolucional
+    for param in model.features.parameters():
+        param.requires_grad = False
+
+    # Congelamos los parametros de la primera capa densa
+    for param in model.classifier[:-4].parameters():
+        param.requires_grad = False
+
+    # Sustituimos la ultima capa densa para adaptarla al numero de clases
+    model.classifier[6] = nn.Linear(4096, num_classes)
+
+    # Perdida: entropia cruzada binaria
+    loss_fn = nn.CrossEntropyLoss() 
+
+    # Optimizador: Adam
+    optimizer = torch.optim.Adam(model.parameters(), lr= 1e-4)
+    
+    return model.to(DEVICE), loss_fn, optimizer
+
+# Cargamos el checkpoint
+checkpoint_vgg19 = torch.load("modelos/vgg19.pth", map_location=torch.device("cpu"), weights_only=False)
+model_vgg19, _ , _ = get_model_vgg19(6)
+model_vgg19.load_state_dict(checkpoint_vgg19["best_model"]["model_state_dict"])
+
+
+@torch.no_grad()
+def predict_classification(
+    image_path, 
+    model=model_vgg19, 
+    label_encoder=label_encoder_classification
+    ):
+    """
+    Da las tres predicciones más probables junto con sus probabilidades para 
+    una foto, a través de un modelo de clasificación de imágenes
+    """
+    model.eval() # Modo inferencia
+    
+    # Leemos la imagen y la transformamos
+    image = cv2.imread(image_path)
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    image = standard_transform_classification(image)[None].to(DEVICE)
+    
+    # Clasificamos y extramos las tres clases mas probables y sus probs
+    out = model(image)    
+    probs = torch.softmax(out, dim=1).squeeze(0) # Quitamos la primera dimension
+    top_3 = torch.topk(probs, k=3)
+    indices = top_3.indices.tolist()  
+    classes = label_encoder.inverse_transform(indices)
+    scores = top_3.values.tolist()   
+    return classes, scores
+```
+
+```{python include=FALSE}
+class_colors = [
+    (255,   0,   0),   # red
+    (  0,   0, 255),   # blue
+    (  0, 128,   0),   # green
+    (255, 165,   0),   # orange
+    (128,   0, 128),   # purple
+    (255, 255,   0),   # yellow
+    (  0,   0, 139),   # darkblue
+    (255,   0, 255),   # magenta
+    (255, 192, 203),   # pink
+    (165,  42,  42),   # brown
+    (128, 128, 128),   # grey
+    (  0, 100,   0)    # darkgreen
+]
+
+label_encoder_od = LabelEncoder()
+label_encoder_od.classes_ = np.array([
+    "Tank (TANK)",
+    "Infantry fighting vehicle (IFV)",
+    "Armored personnel carrier (APC)",
+    "Engineering vehicle (EV)",
+    "Assault helicopter (AH)",
+    "Transport helicopter (TH)",
+    "Assault airplane (AAP)",
+    "Transport airplane (TA)",
+    "Anti-aircraft vehicle (AA)",
+    "Towed artillery (TART)",
+    "Self-propelled artillery (SPART)"
+])
+
+def plot_bbox(image, bbs, confs, labels, label_encoder=label_encoder_od, class_colors=class_colors):
+    """
+    Dibuja unas detecciones a partir de la informacion de las cajas, confianzas 
+    y etiquetas.
+    """
+    for ix, bb in enumerate(bbs):
+      
+        # La etiqueta de la caja
+        complete_label = \
+            label_encoder.inverse_transform([labels[ix].item()])[0] + " - " +  \
+            str(round(confs[ix].item(), 2))
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.9
+        font_thickness = 2
+        text_size, _ = cv2.getTextSize(complete_label, font, font_scale, font_thickness)
+        text_width, text_height = text_size
+      
+        # Tomamos medidas de la caja para centrar la etiqueta
+        x0, y0, x1, y1 = bb
+        x12 = (x0 + x1) / 2
+        x2 = x12 - text_width / 2
+        x3 = x12 + text_width / 2
+
+        x0, y0 = int(x0), int(y0)
+        x1, y1 = int(x1), int(y1)
+        x2, x3 = int(x2), int(x3)
+        
+        # Pintamos caja y etiqueta
+        bgr = class_colors[int(labels[ix].item())]
+        image = cv2.rectangle(image, (x0, y0), (x1, y1), bgr, thickness=4)
+        image = cv2.rectangle(image, (x2 - 20, y0), (x3 + 20, y0 - text_height - 20), bgr, -1)
+        image = cv2.putText(image, complete_label, (x2, y0 - 10), font, 0.9, (255, 255, 255), 2)
+
+    return image
+
+def get_model_ssd300(num_classes):
+    """
+    Nos permite obtener un modelo SSD300 listo para aplicar transfer learning
+    (con su cabeza descongelada) y su optimizador (Adam).
+    """
+    
+    model = ssd300_vgg16(weights=SSD300_VGG16_Weights.DEFAULT)
+
+    for param in model.backbone.parameters():
+        param.requires_grad = False
+
+    in_channels = \
+    [layer.in_channels for layer in model.head.classification_head.module_list]
+
+    boxes_per_class_1 = 364 // 91
+    boxes_per_class_2 = 546 // 91
+
+    num_anchors = [boxes_per_class_1] + \
+      3 * [boxes_per_class_2] + \
+      2 * [boxes_per_class_1]
+
+    model.head = SSDHead(
+        in_channels=in_channels,
+        num_anchors=num_anchors,
+        num_classes=num_classes + 1
+    )
+
+    return model.to(DEVICE)
+
+def decode_output_ssd(output, conf_threshold=0.5):
+    """
+    Decodifica el output de SSD300
+    """
+    bbs = output["boxes"].cpu().detach()
+    labels = torch.tensor([i - 1 for i in output["labels"].cpu()])
+    confs = output["scores"].cpu().detach()
+
+    all_ixs = torch.arange(0, len(confs))
+    ixs = torch.tensor([], dtype=torch.int32)
+
+    for label in labels.unique():
+        if label != 11:
+            label_mask = labels == label
+
+            label_ixs = nms(bbs[label_mask], confs[label_mask], 0.05)
+
+            real_ixs = all_ixs[label_mask][label_ixs]
+
+            final_ixs = real_ixs[confs[real_ixs] > 0.5]
+
+            ixs = torch.cat((ixs, final_ixs))
+
+    bbs, confs, labels = [tensor[ixs] for tensor in [bbs, confs, labels]]
+
+    return bbs, confs, labels
+
+# Cargamos el checkpoint de SSD300
+checkpoint_ssd300 = torch.load("modelos/ssd300.pth", map_location=torch.device("cpu"), weights_only=False)
+model_ssd300 = get_model_ssd300(11)
+model_ssd300.load_state_dict(checkpoint_ssd300["best_model"]["model_state_dict"])
+
+
+@torch.no_grad()
+def predict_ssd(model, image):
+    """
+    Predice con SSD y decodifica su output.
+    """
+    model.eval()
+    image = transforms.ToTensor()(image)
+    output = model(image.unsqueeze(0).to(DEVICE))[0]
+    bbs, confs, labels = decode_output_ssd(output)
+    return bbs, confs, labels
+
+# Cargamos el checkpoint de YOLOv5
+model_yolov5 = YOLO("modelos/yolov5/weights/best.pt")
+
+def decode_output_yolo(output, conf_threshold=0.2):
+    """
+    Predice con YOLO y decodifica su output
+    """
+    bbs = output[0].boxes.xyxy.cpu()
+    confs = output[0].boxes.conf.cpu()
+    labels = output[0].boxes.cls.cpu().int()
+
+    ixs = (confs > conf_threshold) & (labels != 11)
+    bbs = bbs[ixs]
+    confs = confs[ixs]
+    labels = labels[ixs]
+
+    return bbs, confs, labels
+
+def predict_yolo(model, image):
+    """
+    Predice con YOLO y decodifica su output.
+    """
+    output = model.predict(image, device=DEVICE, verbose = False)
+    bbs, confs, labels = decode_output_yolo(output)
+    return bbs, confs, labels
+  
+def detect_yolo(model, image_path, output_path):
+    """
+    Da las detecciones de SSD para una imagen y las pinta
+    """
+    image = cv2.imread(image_path)
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    bbs, confs, labels = predict_yolo(model, image)
+    detection = plot_bbox(image, bbs, confs, labels)
+    cv2.imwrite(output_path, cv2.cvtColor(detection, cv2.COLOR_RGB2BGR))
+    return output_path
+
+def detect_ssd(model, image_path, output_path):
+    """
+    Da las detecciones de SSD para una imagen y las pinta
+    """
+    image = cv2.imread(image_path)
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    bbs, confs, labels = predict_ssd(model, image)
+    detection = plot_bbox(image, bbs, confs, labels)
+    cv2.imwrite(output_path, cv2.cvtColor(detection, cv2.COLOR_RGB2BGR))
+    return output_path
+```
+
+```{python include=FALSE}
+# Matriz de mapeado de colores
+mapping_matrix = np.array(
+  [[  0,   0,   0], # Clase 0 (fondo)
+   [ 65, 105, 225], # Clase 1 (RU_airforce)
+   [  0,   0, 128], # Clase 2 (RU_army)
+   [  0, 191, 255], # Clase 3 (RU_marines)
+   [ 70, 130, 180], # Clase 4 (RU_navy)
+   [220,  20,  60], # Clase 5 (US_airforce)
+   [255, 36,    0], # Clase 6 (US_army)
+   [128,   0,  32], # Clase 7 (US_marines)
+   [255, 166, 150]], dtype=np.uint8) # Clase 8 (US_airforce)
+  
+# Transformacion estandar para nuestro modelo de segmentacion
+standard_transform_ss = transforms.Compose([
+    transforms.ToPILImage(),
+    transforms.Resize((640, 640)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+])
+
+# Definimos la clase de nuestro modelo de segmentacion. Mas detalles en 
+# ss_model.ipynb
+def conv(in_channels, out_channels):
+    return nn.Sequential(
+        nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1),
+        nn.BatchNorm2d(out_channels),
+        nn.ReLU(inplace=True)
+    )
+
+def up_conv(in_channels, out_channels):
+    return nn.Sequential(
+        nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2),
+        nn.ReLU(inplace=True)
+    )
+
+class UNet(nn.Module):
+    def __init__(self, pretrained=True, out_channels=9):
+        super().__init__()
+
+        self.encoder = vgg16_bn(weights=VGG16_BN_Weights.DEFAULT).features
+
+        for params in self.encoder.parameters():
+            params.requires_grad = False
+
+        self.block1 = nn.Sequential(*self.encoder[:6])
+        self.block2 = nn.Sequential(*self.encoder[6:13])
+        self.block3 = nn.Sequential(*self.encoder[13:20])
+        self.block4 = nn.Sequential(*self.encoder[20:27])
+        self.block5 = nn.Sequential(*self.encoder[27:34])
+
+        self.bottleneck = nn.Sequential(*self.encoder[34:])
+        self.conv_bottleneck = conv(512, 1024)
+
+        self.up_conv6 = up_conv(1024, 512)
+        self.conv6 = conv(512 + 512, 512)
+        self.up_conv7 = up_conv(512, 256)
+        self.conv7 = conv(256 + 512, 256)
+        self.up_conv8 = up_conv(256, 128)
+        self.conv8 = conv(128 + 256, 128)
+        self.up_conv9 = up_conv(128, 64)
+        self.conv9 = conv(64 + 128, 64)
+        self.up_conv10 = up_conv(64, 32)
+        self.conv10 = conv(32 + 64, 32)
+        self.conv11 = nn.Conv2d(32, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        block1 = self.block1(x)
+        block2 = self.block2(block1)
+        block3 = self.block3(block2)
+        block4 = self.block4(block3)
+        block5 = self.block5(block4)
+
+        bottleneck = self.bottleneck(block5)
+        x = self.conv_bottleneck(bottleneck)
+
+        x = self.up_conv6(x)
+        x = torch.cat([x, block5], dim=1)
+        x = self.conv6(x)
+
+        x = self.up_conv7(x)
+        x = torch.cat([x, block4], dim=1)
+        x = self.conv7(x)
+
+        x = self.up_conv8(x)
+        x = torch.cat([x, block3], dim=1)
+        x = self.conv8(x)
+
+        x = self.up_conv9(x)
+        x = torch.cat([x, block2], dim=1)
+        x = self.conv9(x)
+
+        x = self.up_conv10(x)
+        x = torch.cat([x, block1], dim=1)
+        x = self.conv10(x)
+
+        x = self.conv11(x)
+
+        return x
+
+# Cargamos el checkpoint de nuestra U-Net
+checkpoint_unet = torch.load("modelos/unet.pth", map_location=torch.device("cpu"), weights_only=False)
+model_unet = UNet().to(DEVICE)
+model_unet.load_state_dict(checkpoint_unet["best_model"]["model_state_dict"])
+
+def decode_pred_mask(pred_mask):
+    """
+    Decodifica una predicción individual de U-Net. Toma el argmax por canal.
+    """
+    decoded_mask = torch.max(pred_mask[0], 0)[1].int()
+    return decoded_mask
+
+@torch.no_grad()
+def predict_unet(image, model, transform=standard_transform_ss):
+    model.eval()
+    image = transform(image)
+    pred_mask = model(image[None].float().to(DEVICE))
+    decoded_pred_mask = decode_pred_mask(pred_mask)
+    return decoded_pred_mask.cpu().numpy()
+  
+def color_mask(mask, mapping_matrix=mapping_matrix):
+    colored_mask = mapping_matrix[mask]
+    return colored_mask
+  
+def segment_unet(model, image_path, output_path):
+    image = cv2.imread(image_path)
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    mask = predict_unet(image, model)
+    colored_mask = color_mask(mask, mapping_matrix)
+    cv2.imwrite(output_path, cv2.cvtColor(colored_mask, cv2.COLOR_RGB2BGR))
+    return output_path
+```
+
+# Enfoque, Tareas y Modelos {data-navmenu="Introducción"}
+## Fila {data-height=200}
+### Resumen del Trabajo 
+El trabajo ofrece una introducción a la disciplina de la Visión por Computador, centrándose en el ámbito militar.
+  
+Nos centramos en los problemas de clasificación, detección de objetos y segmentación, explorando las técnicas actuales basadas en redes neuronales profundas y arquitecturas convolucionales. Estas serán las utilizadas para abordar las tareas elegidas.
+  
+Las arquitecturas elegidas para el trabajo son, para clasificación: VGG-19; para detección: YOLO y SSD; y, por último, para segmentación: U-Net. Usaremos *transfer-learning* para obtener un mejor rendimiento.
+  
+Todo lo anterior dará lugar a la implementación práctica de estos modelos sobre conjuntos de datos de temática militar, donde se exploran los retos inherentes a la consecución de estas tareas en el ámbito militar. Mientras que la limpieza de datos se hará con R, utilizando, principalmente, con el entrono tidyverse, la parte de modelado se hará empleando el lenguaje de programación Python y se apoyará, principalmente, en la biblioteca Pytorch.
+
+Todo este trabajo ha dado lugar al presente cuadro de mandos, donde se podrá experimentar con los modelos obtenidos, así como obtener estadística descriptiva de los datos usados.
+  
+## Fila {data-height=75}
+### Enfoque
+
+Basándonos en las necesidades del ámbito que hemos escogido, vamos a poner el foco en tres tareas concretas. La primera será la **clasificación**, que servirá como introducción a la Visión por Computador y a los modelos que sustentan el resto de técnicas. Las otras dos tareas son la **detección de objetos** y la **segmentación de imágenes**. Para abordarlas, primero es necesario delimitar de forma precisa el alcance de cada una de ellas.
+
+
+## Fila {data-height=200}
+### Clasificación de Imágenes
+
+Consiste en asignar una etiqueta, de un conjunto predefinido, a una imagen. Se presupone que una de las etiquetas de este conjunto será la más adecuada para la imagen por su propia naturaleza.
+
+
+### Detección de Objetos
+
+En esta tarea se busca localizar y clasificar objetos dentro de imágenes. Un objeto es cada entidad que queremos detectar y clasificar. Cada objeto pertenece a una clase de un conjunto definido de antemano. Para localizar objetos, normalmente se emplean **rectángulos delimitadores**, intentando que sean lo más ajustados posible al contorno del objeto.
+
+- Si solo aparece un objeto por imagen, hablamos de un **problema de localización de objetos**.
+- Si aparecen varios objetos en una misma imagen, hablamos de **detección de objetos**.
+
+#### Enfoques modernos
+
+- **Métodos convolucionales de dos etapas**  
+  1. Se extraen regiones propuestas de la imagen (proposal stage).  
+  2. Para cada región, se extraen características y se predice la posición y la clase del objeto.  
+
+- **Métodos convolucionales de una etapa**  
+  Eliminan la fase de proposición de regiones y realizan la detección directamente sobre la imagen completa, lo que suele ser más rápido pero menos preciso.
+
+- **Métodos basados en Transformers**  
+  Utilizan el mecanismo de atención para considerar toda la imagen en contexto, asignando más relevancia a las zonas que contienen objetos.
+
+> **Comparativa:**  
+> - Los métodos de dos etapas son más precisos pero más lentos (difíciles de usar en tiempo real).  
+> - Los métodos de una etapa son más rápidos pero menos precisos.  
+> - Los basados en Transformers combinan precisión y contexto global, y son los más recientes.
+
+
+### Segmentación
+
+Consiste en dividir una imagen en regiones significativas. Las variantes más relevantes son:
+
+- **Segmentación Semántica**  
+  Clasifica cada píxel según la clase de objeto a la que pertenece (por ejemplo, "cielo", "edificio", "persona").
+
+- **Segmentación de Instancia**  
+  Detecta y separa los píxeles correspondientes a cada instancia individual de las clases de interés (por ejemplo, distingue entre varias personas).
+
+- **Segmentación Panóptica**  
+  Combina semántica e instancias: clasifica los píxeles y distingue entre diferentes instancias cuando tiene sentido (por ejemplo, no diferencia dos zonas de cielo, pero sí dos personas).
+
+# Conjuntos de datos {data-navmenu="Introducción"}
+## Fila {data-height=100}
+### Procesamiento Previo 
+Para que los datos pudisen ser leidos sin problemas en Windows, teniendo en cuenta la limitación de tamaño de *path* en este sistema operativo, se han cambiado todos los nombres de las imágenes por nombres sistemáticos y más cortos, del tipo `img_<número>`. De esta forma, en es más fácil no superar la longitud máxima del *path*. Esto es importante ya que, las imágenes cuya ruta la superen se corromperán. Todo el proceso de cambio de nombre se ha realizado sin hacer ningún tipo de suposición sobre los datos, como que las anotaciones en validación estuviesen parejas a las imágenes o que los pares imágen-máscara en segmentación estuviesen correctamente nombrados. Se ha añadido un CSV a cada conjunto de datos con la conversión del nuevo nombre al antiguo para cada elemento.
+
+## Fila {data-height=400}
+### Clasificación
+La tarea de clasificación no surge de forma natural en el ámbito militar. Por este motivo, encontrar un conjunto de datos preparado para este problema es difícil.
+
+Para solventar esta dificultad, utilizaremos un conjunto de detección de objetos del que solo conservamos las imágenes con un único objeto. Asignamos a estas imágenes la clase del objeto. El conjunto de datos elegido será el que encontramos en kaggle pinchando [aquí](https://www.kaggle.com/datasets/mexwell/militarycivilian-vehicles-image-classification). En él, originalmente se intentaba detectar vehículos militares y civiles. Hay **6 clases**:
+
+- **civilian aircraft**
+- **civilian car**
+- **military aircraft** 
+- **military helicopter**  
+- **military truck**
+- **military tank**
+
+El conjunto de datos original está formado por una carpeta con **6 642 imágenes**, todas las del conjunto, y los ficheros con anotaciones. Estos están en formato CSV, TF Records, TXT y XML. Son dos archivos distintos, uno con las anotaciones del conjunto de entrenamiento y otro con las del conjunto de validación, que los creadores del *dataset* llaman test. Realmente, tras descargarlo, eliminamos todos los formatos salvo el CSV, y cambiamos el nombre a algunos ficheros. El resultado final lo encontramos en la carpeta de Drive del proyecto.  
+Para la limpieza de este conjunto de datos consultar `classification_dataset.Rmd`.
+
+### Detección de Objetos
+Modelos de este tipo pueden ayudar a hacer productos de inteligencia o asistir en labores de pilotaje de drones. El conjunto elegido lo podemos encontrar en kaggle pinchando [aquí](https://www.kaggle.com/datasets/nzigulic/military-equipment).
+
+En este conjunto tenemos **11 clases** asociadas a vehículos militares:
+
+- **tank (TANK)**
+- **infantry fighting vehicle (IFV)**  
+- **armored personnel carrier (APC)**  
+- **engineering vehicle (EV)**    
+- **assault helicopter (AH)**  
+- **transport helicopter (TH)**  
+- **assault airplane (AAP)**  
+- **transport airplane (TA)**  
+- **anti-aircraft vehicle (AA)**  
+- **towed artillery (TART)** 
+- **self-propelled artillery (SPART)**
+
+Como se explica en el artículo, gran parte de las imágenes han sido sacadas de canales de Telegram dedicados a documentar la Guerra ruso-ucraniana (especialmente desde 2021), además de diferentes portales de noticias.
+
+El *dataset* cuenta con **16 809 imágenes**, que los autores han dividido en:
+
+- **11 768** imágenes de entrenamiento  
+- **1 680** imágenes de validación  
+- **3 361** imágenes de test  
+
+Todas ellas en formato PNG o JPG. Cada imagen está acompañada de un archivo `.txt` con su mismo nombre y su anotación. Estas anotaciones se encuentran en el formato Darknet.  
+
+Dentro de la carpeta principal del conjunto hay dos subdirectorios:
+
+1. `images/`  
+   - `train/`  
+   - `val/`  
+   - `test/`  
+2. `labels/`  
+   - `train/`  
+   - `val/`  
+   - `test/`  
+
+Para la limpieza de este conjunto de datos consultar `od_dataset.Rmd`.
+
+### Segmentación
+Como etiquetar datos de este tipo puede ser muy costoso en cuanto a tiempo, los conjuntos de segmentación semántica son relativamente inusuales. También suelen estar dedicados a otras áreas donde este campo ha sido aplicado de forma más extensiva, como Ciencias de la Salud. El único conjunto de este tipo de temática puramente militar lo encontramos en Roboflow y lo encontramos [aquí](https://universe.roboflow.com/eep567-x0zpr/friend_or_foe_merged_semantic_segmentation/dataset/1). Está etiquetado a mano por un usuario para uno de sus proyectos y se ha colgado de forma pública. Resaltamos que este usuario no ha asociado ningún modelo entrenado con este conjunto al proyecto, como sí suele hacerse en Roboflow.
+
+En este conjunto tratamos de identificar los píxeles asociados a diferentes unidades del ejército de los Estados Unidos y del ejército ruso. Concretamente, según la documentación adjunta, tenemos las **9 clases**:
+
+- **background**  
+- **RU_airforce**  
+- **RU_army**  
+- **RU_marines**  
+- **RU_navy**  
+- **US_airforce**  
+- **US_army**  
+- **US_marines**  
+- **US_navy**  
+
+Las cuatro primeras corresponden con tipos de tropas rusas, las cuatro siguientes son sus versiones estadounidenses y la última se corresponde con el fondo, que es todo lo que no pertenezca a esas clases.
+
+El *dataset* posee **2 328 imágenes** de entrenamiento, **220** de validación y **104** de test. Estas están en formato JPG. Sus máscaras asociadas tendrán el mismo nombre que las imágenes seguido del sufijo `_mask` y están en formato PNG. Las máscaras realmente son imágenes en formato RGB, pero en cada canal cada píxel tiene el número asociado a su clase. Como consecuencia, estas máscaras no pueden ser visualizadas, pues al ser valores cercanos a 0 (del 0 al 8), la máscara se ve prácticamente negra. Se especifica que tanto las imágenes como las máscaras han sido redimensionadas a $640\times640$.
+
+Cabe mencionar que, realmente, el conjunto de entrenamiento original contenía tan solo **776 imágenes**, pero que, dentro del propio proyecto, se aplica *data augmentation*, obteniendo, por cada imagen original:
+
+1. Una con una rotación de hasta 5º a izquierda o derecha  
+2. Una difuminada  
+3. Una con ruido  
+
+Solo podemos descargar las imágenes resultantes de este proceso, de ahí el número final de **$776\times3=2328$ imágenes**. Las máscaras son también transformadas para casar con las imágenes.  
+
+Para la limpieza de este conjunto de datos consultar `ss_dataset.Rmd`.
+
+
+
+# Introducción al Modelo Usado {data-navmenu="Clasificación"}
+## Fila
+### VGG-19
+La familia VGG fue desarrollada por miembros del "Visual Geometry Group" de la Universidad de Oxford y presentada en 2014. Su trabajo pretendía evaluar el efecto de añadir más capas al desempeño de los modelos en el dataset ILSVRC de la competición ImageNet.
+
+<figure>
+  <img src="imagenes/vgg16.png" alt="Diagrama de VGG16" width="600px" style = "display: block; margin-left: auto; margin-right: auto; margin-top: 2em; margin-bottom: 2em;">
+</figure>
+
+Se construyeron varias configuraciones respetando los mismos principios. Todas las capas ocultas, tanto convolucionales como densas, van seguidas de una activación ReLU. Se usa *same padding* en todas las capas convolucionales. Nosotros usaremos VGG-19. Arriba podemos ver un diagrama de VGG-16, muy parecida a VGG-19.  
+
+El número en cada nombre hace referencia al número de capas ocultas de la red neuronal. Este patrón será muy usual en este campo.  
+
+Podemos encontrar todo lo relativo al entrenamiento y evaluación de este modelo en `classification_model.ipynb`.
+
+
+
+# Listado de las Imágenes {data-navmenu="Clasificación"}
+```{r}
+train_labels_classification = read_csv("datasets/classification_dataset/train_labels.csv")
+val_labels_classification = read_csv("datasets/classification_dataset/val_labels.csv")
+train_labels_augmented_classification = read_csv("datasets/classification_dataset_augmented/train_labels.csv")
+```
+
+## Fila {.sidebar}
+**¿Qué datos mostramos?**
+```{r}
+# Control numerico para seleccionar el numero de filas a mostrar
+numericInput("num_rows_classification", "Número de filas a mostrar:", value = 10, min = 1, max = nrow(train_labels_augmented_classification))
+
+# Menu desplegable para filtrar por especie
+selectInput("class_filter_classification", "Filtrar por clase:", 
+            choices = c("Todas" = "todas", 
+                        "civilian aircraft" = "0",
+                        "civilian car" = "1",
+                        "military aircraft" = "2",
+                        "military helicopter" = "3",
+                        "military tank" = "4",
+                        "military truck" = "5"))
+
+# Menu desplegable para filtrar por especie
+selectInput("dataset_filter_classification", "Filtrar por dataset:", 
+            choices = c("Entrenamiento", "Validación"))
+
+# Menu desplegable para filtrar por especie
+selectInput("augmentation_filter_classification", "Filtrar por augmentation:", 
+            choices = c("Con Data Augmentation", "Sin Data Augmentation"))
+```
+
+## Fila
+### Listado de Imágenes
+```{r}
+renderDT({
+  # Elegimos el dataset seleccionado
+  if (input$dataset_filter_classification == "Entrenamiento") {
+    if (input$augmentation_filter_classification == "Con Data Augmentation") {
+      data = train_labels_augmented_classification
+    } else {
+      data = train_labels_classification
+    }
+  } else {
+    data = val_labels_classification 
+  }
+  
+  # Filtrar por clase si procede
+  if (input$class_filter_classification != "todas") {
+    filtered_data = data %>%
+      filter(object_class == input$class_filter_classification)
+  } else {
+    filtered_data = data
+  }
+  
+  # Limitar filas y seleccionar una columna
+  if (is.na(input$num_rows_classification)) {
+    n_rows = 0
+  } else {
+    n_rows = input$num_rows_classification
+  }
+  
+  filtered_data = filtered_data %>%
+    slice_head(n = n_rows) %>%
+    select(filename)
+  
+  # Mostrar el numero de filas seleccionado
+  datatable(
+    filtered_data, 
+    options = list(
+      dom = 't',  # Muestra solo la tabla sin controles adicionales
+      pageLength = n_rows
+    )
+  )
+})
+```
+
+# Análisis Exploratorio de Datos {data-navmenu="Clasificación"}
+## Fila {.sidebar}
+**¿Sobre qué datos mostramos estadísticas?**
+```{r}
+selectInput("eda_classification_data","Subconjunto:",choices=c("Entrenamiento"="train","Validación"="val"))
+```
+
+```{r}
+selectInput("eda_classification_aug","¿Con o sin augmentations?",choices=c("Sin augmentations"="noaug","Con augmentations"="aug"))
+```
+
+
+## Gráficas del Conjunto de Datos de Clasificación {.tabset}
+
+### Gráfica de Barras de las Clases
+```{r}
+imageOutput("eda_class_plot")
+```
+
+```{r}
+output$eda_class_plot = renderImage({
+
+  # Dependiendo de los inputs construimos la ruta del fichero
+  dataset = input$eda_classification_data    # "train" o "val"
+  aug = input$eda_classification_aug     # "aug" o "noaug"
+  
+  # Si es validación, siempre ponemos la misma imagen
+  if (dataset == "val") {
+    file = "plots/classification_val.png"
+  } else {
+    # entrenamiento con/sin augmentation
+    file = str_c("plots/classification_", dataset, "_", aug, ".png")
+  }
+  
+  # Devolvemos la lista para renderImage
+  list(src = file,
+    contentType = "image/png",
+    style = "display: block; margin-left: auto; margin-right: auto; width=100%;"
+  )
+}, deleteFile = FALSE)
+```
+
+
+### Muestra Aleatoria de las Clases
+```{python results='hide'}
+train_labels_classification = pd.read_csv("datasets/classification_dataset/train_labels.csv")
+val_labels_classification = pd.read_csv("datasets/classification_dataset/val_labels.csv")
+total_labels_classification = pd.concat([train_labels_classification, val_labels_classification])
+arranged_classes = label_encoder_classification.inverse_transform(np.arange(6))
+n_classes = len(arranged_classes)
+n_images = 3
+
+fig, axs = plt.subplots(n_images, n_classes, figsize=(10, 6))
+for j in range(n_classes):
+    class_imgs = total_labels_classification["filename"][total_labels_classification["object_class"] ==  j].values
+    np.random.shuffle(class_imgs)
+    for i in range(n_images):
+        img = cv2.imread(f"datasets/classification_dataset/images/{class_imgs[i]}")
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        _ = axs[i, j].imshow(img)
+        _ = axs[i, j].axis("off")
+        _ = axs[i, j].set_title(arranged_classes[j])
+
+fig.suptitle("Muestra Conjunta de Entrenamiento y Validación\n sin Augmentations")
+fig.tight_layout()
+plt.show()
+```
+
+# Predicción {data-navmenu="Clasificación"}
+## Fila {.sidebar}
+Introduce una foto y te la clasificamos:
+```{r}
+fileInput("image_upload_classification", "Sube una imagen:", accept = c('image/png', 'image/jpeg'))
+actionButton("predict_btn_classification", "Clasificar imagen")
+```
+
+## Fila
+
+### Predicción
+```{r}
+uiOutput("classification_result")
+```
+
+```{r}
+output$classification_result = renderUI({
+  req(input$predict_btn_classification, input$image_upload_classification)
+  
+  image_path = input$image_upload_classification$datapath
+   
+  # Llamamos a la función Python  
+  res = py$predict_classification(image_path)
+  
+  # Extraemos clases y puntuaciones en vectores R
+  classes = unlist(res[[1]])
+  scores = unlist(res[[2]])
+  
+  # Texto de la clase principal
+  main_class = classes[1]
+  
+  tagList(
+    tags$h4("Creemos que esta imagen pertenece a la clase:"),
+    tags$h2(style = "margin-top: 0.2em; text-align: center;", main_class),
+    div(style = "margin-bottom: 0.5em;",
+        gauge(
+          value = round(scores[1] * 100, 2),
+          min = 0,
+          max = 100,
+          symbol = '%',
+          gaugeSectors(
+            success = c(80, 100),
+            warning = c(50, 79),
+            danger = c(0, 49)
+          )
+        )
+    ),
+    tags$h4("Otras posibles clases:"),
+    div(
+      style = "display: flex; justify-content: space-between; gap: 1em; padding: 0; margin: 0; overflow-y: hidden;",
+      lapply(2:3, function(i) {
+        div(
+          style = "text-align: center; margin: 0;",
+          tags$h3(classes[i]),
+          gauge(
+            value = round(scores[i] * 100, 2),
+            min = 0,
+            max = 100,
+            symbol = '%',
+            label = "Probabilidad",
+            gaugeSectors(
+              success = c(80, 100),
+              warning = c(50, 79),
+              danger = c(0, 49)
+            )
+          )
+        )
+      })
+    )
+  )
+})
+```
+
+
+### Visualización
+```{r}
+imageOutput("classification_preview", width = "100%")
+```
+
+```{r}
+output$classification_preview = renderImage({
+  req(input$image_upload_classification) # No hagas nada hasta que la subamos
+  list(
+    src = input$image_upload_classification$datapath,
+    contentType = input$image_upload_classification$type,
+    alt = "Imagen subida",
+    style= "display: block; margin: 0 auto; width: 100%;" # La centramos
+  )
+}, deleteFile = FALSE)
+
+```
+
+# Introducción al Modelo Usado {data-navmenu="Detección de Objetos"}
+## Fila
+### SSD300
+Se trata de un método de detección de objetos de un solo paso que se basa en utilizar mapas de características de diferentes capas para detectar objetos a diferentes escalas. Su nombre viene de *Single Shot Multibox Detector*. Este modelo lo probaremos en la sección correspondiente.  
+
+Podemos encontrar todo lo relativo al entrenamiento y evaluación de SSD300 en `od_models.ipynb`.
+
+<figure>
+  <img src="imagenes/ssd.png" alt="Diagrama de VGG16" width="600px" style = "display: block; margin-left: auto; margin-right: auto; margin-top: 2em; margin-bottom: 2em;">
+</figure>
+
+Para esta técnica se eligen una serie de cajas por defecto o *default boxes*, cuya idea es similar a la de las *anchor boxes*. En el artículo original se seleccionan 6, aunque en algunas fases del modelo se usan solo 4.
+
+En este método, se escoge una arquitectura determinada de red neuronal como *backbone* y se eliminan las capas densas del final si las hay. Tras esto, se añaden una serie de capas convolucionales a esta última parte.
+
+Al pasar una imagen tanto por la *backbone* como por las capas convolucionales extra, se van generando distintos mapas de características. A algunos de estos mapas se les asigna una serie de predicciones: para cada caja por defecto, offsets para las dos coordenadas de su centro, su altura y su anchura, además de una puntuación para cada clase (y una clase extra de “fondo”).
+
+Si tenemos un mapa de características de tamaño $n \times m \times d$, se asigna una predicción a cada posición de las dimensiones espaciales, es decir, $n \cdot m$. Esto se consigue mediante una capa convolucional con filtros 3×3 y padding 1. Si hay $c$ clases y $k$ cajas por defecto, la capa debe tener $(c + 4) \cdot k$ filtros, lo que produce $n \cdot m \cdot k$ detecciones en ese mapa.
+
+El conjunto de detecciones finales se obtiene combinando las detecciones de todos los mapas de características. El modelo original, que acepta imágenes RGB 300×300, produce 8 732 detecciones por imagen, desglosadas en la siguiente tabla. Por ello se le conoce como SSD300.
+
+| Detección | Número de Detecciones            |
+|-----------|----------------------------------|
+| 1         | $38 \times 38 \times 4  = 5 776$ |
+| 2         | $19 \times 19 \times 6  = 2 166$ |
+| 3         | $10 \times 10 \times 6  =   600$ |
+| 4         | $5 \times  5 \times 6  =   150$  |
+| 5         | $3 \times  3 \times 4  =    36$  |
+| 6         | $1 \times  1 \times 4  =     4$  |
+| **Detecciones Totales** | **8 732**          |
+
+*El orden corresponde al que se sigue en el modelo.* 
+
+### YOLO
+Su nombre es la abreviatura de _You Only Look Once_ (solo miras una vez), filosofía en la que se basa este framework de detección de objetos. Desde su primera creación, diferentes versiones de YOLO han ido apareciendo, tratando de mejorar algunos aspectos de este modelo. Aquí explicamos la idea original y damos una idea de los avances que han ido surgiendo en diferentes versiones.
+  
+Podemos encontrar todo lo relativo al entrenamiento y evaluación de YOLOv3m en `od_models.ipynb`.  
+
+#### YOLO original
+
+Presentado en 2015, se basa en tratar la tarea de detección de objetos como un problema de regresión. De esta forma, los autores idean una única red neuronal cuya salida será todos los componentes necesarios para detectar los objetos de una imagen. Así, los objetos no son analizados de forma independiente, como ocurría en la familia RCNN, sino que de una sola pasada se tratan de detectar todos los de la foto. Esta última idea es la que da nombre a este enfoque.
+
+Siguiendo esta idea, los autores proponen una arquitectura cuya descripción resumida se muestra en la siguiente tabla. La activación de la última capa es lineal y en el resto de capas se utiliza *LeakyReLU*, definida como:
+
+$$
+\mathrm{LeakyReLU}(x) = \max\{0.1 \, x,\; x\}
+$$
+
+La red se entrena inicialmente como un modelo de clasificación, luego se eliminan las capas densas finales, se añaden cuatro capas convolucionales y dos densas, y se reentrena para detección. La resolución de las imágenes pasa de 224×224 a 448×448.
+
+Con esta arquitectura, la imagen se divide en una rejilla $S\times S$ y, para cada celda, se predicen, para $B$ cajas, la “puntuación de objetividad” (objectness), las coordenadas del centro $(x,y)$, la altura $h$ y anchura $w$, además de las probabilidades de pertenencia a cada una de las $C$ clases. Esto equivale a que la salida de la última capa sea un tensor de dimensión
+
+$$
+S \times S \times (5B + C).
+$$
+
+Los autores escogen $S=7$, $B=2$ y $C=20$, trabajando con Pascal VOC (20 clases).
+
+No debe confundirse $B$ (número de cajas predichas) con las *anchor boxes*. Estas últimas tienen tamaños prefijados y se ajustan, mientras que YOLO original predice directamente varias cajas sin anclas predefinidas. Durante el entrenamiento, la predicción empleada es la caja cuya IoU sea mayor con la verdad terreno; en inferencia, se elige la predicción con mayor puntuación de objetividad.
+
+Las anotaciones están en formato Darknet, por lo que las coordenadas de salida de la capa lineal deben mapearse al intervalo [0, 1] antes o después (según implementación).
+
+####  Evolución de YOLO
+
+- **YOLOv2 (YOLO9000)** introdujo las *anchor boxes*, resolviendo problemas de superposición y cercanía de objetos. Las anclas se obtienen por clustering k-medias. La arquitectura base pasó a DarkNet-19.
+  
+- **YOLOv3** mantuvo el uso de *anchor boxes* y añadió detección a múltiples escalas para mejorar la precisión en objetos pequeños, usando DarkNet-53 como backbone.
+
+En ambas versiones, las redes se entrenan primero para clasificación y luego se adaptan (modificando sus últimas capas) para detección, de modo que la salida de detección sea directamente el tensor de la rejilla.
+
+En versiones posteriores, la forma de generar y elegir *anchor boxes* se refinó aún más. Incluso hay variantes (YOLOX, YOLOv8) que prescinden de ellas.
+
+A partir de YOLOv5, Ultralytics lanzó versiones de la comunidad que generaron controversia por su similitud con los modelos oficiales y por la rapidez de actualización (de YOLOv8 a YOLOv12 en dos años), así como por debates sobre licencias y código comercial. 
+
+Nosotros usaremos YOLOv5m (realmente YOLOv5m-u de Ultrlytics).  
+
+# Listado de las Imágenes {data-navmenu="Detección de Objetos"}
+```{r}
+classes_od = c(
+  "Tank (TANK)",
+  "Infantry fighting vehicle (IFV)",
+  "Armored personnel carrier (APC)",
+  "Engineering vehicle (EV)",
+  "Assault helicopter (AH)",
+  "Transport helicopter (TH)",
+  "Assault airplane (AAP)",
+  "Transport airplane (TA)",
+  "Anti-aircraft vehicle (AA)",
+  "Towed artillery (TART)",
+  "Self-propelled artillery (SPART)"
+)
+
+# Entrenamiento
+od_dataset_pv_train = read_feather("datasets/od_dataset_df/od_dataset_pv_train.feather") %>%
+  mutate(
+    class = classes_od[class + 1]
+  ) %>%
+  group_by(image, class) %>%
+  tally(name = "count") %>%
+  pivot_wider(
+    names_from   = class,
+    values_from  = count,
+    values_fill  = 0
+  )
+
+# Validacion
+od_dataset_pv_val = read_feather("datasets/od_dataset_df/od_dataset_pv_val.feather") %>%
+  mutate(
+    class = classes_od[class + 1]
+  ) %>%
+  group_by(image, class) %>%
+  tally(name = "count") %>%
+  pivot_wider(
+    names_from   = class,
+    values_from  = count,
+    values_fill  = 0
+  )
+
+# Test
+od_dataset_pv_test = read_feather("datasets/od_dataset_df/od_dataset_pv_test.feather") %>%
+  mutate(
+      class = classes_od[class + 1]
+  ) %>%
+  group_by(image, class) %>%
+  tally(name = "count") %>%
+  pivot_wider(
+    names_from   = class,
+    values_from  = count,
+    values_fill  = 0
+  )
+```
+
+## Fila {.sidebar}
+**¿Qué datos mostramos?**
+```{r}
+# Control numerico para seleccionar el numero de filas a mostrar
+numericInput("num_rows_od", "Número de filas a mostrar:", value = 10, min = 1, max = nrow(od_dataset_pv_train))
+
+checkboxGroupInput("class_filter_od", "Filtrar por clase:",
+                   choices = c("Tank (TANK)",
+                               "Infantry fighting vehicle (IFV)",
+                               "Armored personnel carrier (APC)",
+                               "Engineering vehicle (EV)",
+                               "Assault helicopter (AH)",
+                               "Transport helicopter (TH)",
+                               "Assault airplane (AAP)",
+                               "Transport airplane (TA)",
+                               "Anti-aircraft vehicle (AA)",
+                               "Towed artillery (TART)",
+                               "Self-propelled artillery (SPART)"))
+
+# Menu desplegable para filtrar por especie
+selectInput("dataset_filter_od", "Filtrar por dataset:", 
+            choices = c("Entrenamiento", "Validación", "Test"))
+```
+
+## Fila
+
+### Listado de Imágenes
+
+```{r}
+renderDT({
+  # Seleccionamos los datos de
+  if (input$dataset_filter_od == "Entrenamiento") {
+      data = od_dataset_pv_train
+  } else {
+    if (input$dataset_filter_od == "Validación") {
+        data = od_dataset_pv_val
+    } else {
+        data = od_dataset_pv_test
+    }
+  }
+  
+
+  # Filtramos las imagenes que contengan todas las clases seleccionadas
+  if (length(input$class_filter_od) > 0) {
+    data = data %>%
+      filter(if_all(all_of(input$class_filter_od), ~ . >= 1))
+  }
+
+  # Limitamos las filas
+  if (is.na(input$num_rows_od)) {
+    n_rows = 0
+  } else {
+    n_rows = input$num_rows_od
+  }
+  
+  data = data %>%
+    slice_head(n = n_rows)
+  
+  # Nos quedamos solo con las columnas relevantes segun la seleccion
+  if (length(input$class_filter_od) > 0) {
+    data = data %>% 
+      select(image, all_of(input$class_filter_od))
+  }
+
+  # Mostramos la tabla
+  datatable(
+    data,
+    options = list(
+      dom = 't',
+      pageLength = n_rows
+    ),
+    rownames = FALSE
+  )
+})
+```
+
+# Análisis Exploratorio de Datos {data-navmenu="Detección de Objetos"}
+## Fila {.sidebar}
+**¿Sobre qué datos mostramos estadísticas?**
+```{r}
+selectInput("eda_od_data", "Subconjunto:", choices = c("Entrenamiento" = "train",
+                                                       "Validación" = "val", 
+                                                       "Test" = "test"))
+```
+
+```{r}
+selectInput("eda_od_object","¿De qué tipo de objeto?",
+            choices = c(
+              "Todos los tipos" = "todo",
+              "Tank (TANK)" = "0",
+              "Infantry fighting vehicle (IFV)" = "1",
+              "Armored personnel carrier (APC)" = "2",
+              "Engineering vehicle (EV)" = "3",
+              "Assault helicopter (AH)" = "4",
+              "Transport helicopter (TH)" = "5",
+              "Assault airplane (AAP)" = "6",
+              "Transport airplane (TA)" = "7",
+              "Anti-aircraft vehicle (AA)" = "8",
+              "Towed artillery (TART)" = "9",
+              "Self-propelled artillery (SPART)" = "10"
+            ))
+```
+
+
+## Fila
+
+### Gráficas
+
+```{r}
+imageOutput("eda_od_plot")
+```
+
+```{r}
+output$eda_od_plot = renderImage({
+
+  # Dependiendo de los inputs construimos la ruta del fichero
+  dataset = input$eda_od_data # "train", "val" o "test"
+  object_class = input$eda_od_object # "todo" "0", "1", ... "10"
+  
+  if (object_class == "todo") {
+    # todo el dataset que hayamos indicado
+    file = str_c("plots/od_", dataset, ".png")
+  } else {
+    # la clase de objeto del dataset indicado
+    file = str_c("plots/od_", dataset, "_", object_class, ".png")
+  }
+  
+  # Devolvemos la lista para renderImage
+  list(src = file,
+    contentType = "image/png",
+    width=1000,
+    style = "display: block; margin-left: auto; margin-right: auto;"
+  )
+}, deleteFile = FALSE)
+```
+
+
+# Predicción {data-navmenu="Detección de Objetos"}
+
+## Fila {.sidebar}
+Introduce una foto y detectamos los vehículos militares en ella:
+```{r}
+selectInput("model_choice_od","Modelo:",choices=c("SSD300"="ssd","YOLOv5"="yolo"))
+fileInput("image_upload_od","Sube una imagen:",accept=c('image/png','image/jpeg'))
+actionButton("predict_btn_od","Detectar objetos")
+```
+
+## Fila
+### Predicción
+```{r}
+detected = reactiveVal(FALSE)
+```
+
+
+```{r}
+# Cuando se pulsa el boton marcamos que ya se ha detectado
+observeEvent(input$predict_btn_od, {
+  # Solo si hay imagen
+  req(input$image_upload_od)
+  detected(TRUE)
+})
+
+# Cuando cambie la imagen reseteamos a no detectado
+observeEvent(input$image_upload_od, {
+  detected(FALSE)
+})
+```
+
+
+```{r}
+output$output_image_od = renderImage({
+  req(input$image_upload_od)
+  
+  # Si no hemos detectado muestramos la preview
+  if (!detected()) {
+    list(
+      src = input$image_upload_od$datapath, 
+      contentType = input$image_upload_od$type,
+      width = "1000px",
+      style = "display: block; margin-left: auto; margin-right: auto;"
+    )
+  } else {
+    # Una vez detectado, generamos la imagen con detecciones
+    infile = input$image_upload_od$datapath
+    tmp = tempfile(fileext = ".png")
+    
+    if (input$model_choice_od == "ssd") {
+      py$detect_ssd(py$model_ssd300, infile, tmp)
+    } else {
+      py$detect_yolo(py$model_yolov5, infile, tmp)
+    }
+    
+    list(
+      src = tmp,
+      contentType = "image/png",
+      width = "1000px",
+      style = "display: block; margin-left: auto; margin-right: auto;"
+    )
+  }
+}, deleteFile = FALSE)
+
+```
+
+```{r}
+# La deteccion centrada
+imageOutput("output_image_od", width = "80%")
+```
+
+# Introducción al Modelo Usado {data-navmenu="Segmentación Semántica"}
+## Fila
+### U-Net
+
+<figure>
+  <img src="imagenes/unet.png" alt="Diagrama de U-Net" width="600px" style = "display: block; margin-left: auto; margin-right: auto; margin-top: 2em; margin-bottom: 2em;">
+</figure>
+
+Este modelo, basado en FCN y presentado al año siguiente, en 2016, recibe su nombre de la forma del diagrama, en el que se describe su funcionamiento. Podemos ver que se trata de una red completamente convolucional, en la que existen una serie de capas que bajan la resolución de la imagen en varias fases y otras que, de forma casi simétrica, la aumentan mediante convoluciones traspuestas. La parte realmente innovadora es que el resultado final de cada fase de reducción de resolución se concatena a la entrada de la fase correspondiente de aumento de resolución.
+
+La intuición detrás de esto es aprovechar la información espacial de las primeras capas junto con la información semántica de las últimas. Nótese que, al no existir completa simetría entre las fases de bajada y subida de resolución, es necesario recortar los tensores de salida de cada fase de bajada para poder concatenarlos correctamente.
+
+La función de pérdida utilizada con este modelo en el artículo original era la entropía cruzada binaria, adaptada al problema médico que se pretendía resolver.  
+
+Podemos encontrar todo lo relativo al entrenamiento y evaluación de U-Net en `ss_model.ipynb`.  
+
+
+# Listado de las Imágenes {data-navmenu="Segmentación Semántica"}
+```{r}
+classes_ss = c(
+  "background",
+  "RU_airforce",
+  "RU_army",
+  "RU_marines",
+  "RU_navy",
+  "US_airforce",
+  "US_army",
+  "US_marines",
+  "US_navy"
+)
+
+# Entrenamiento
+ss_class_dataframe_train = read_feather("datasets/ss_dataset_df/ss_class_dataframe_train.feather") 
+
+# Validacion
+ss_class_dataframe_val = read_feather("datasets/ss_dataset_df/ss_class_dataframe_val.feather") 
+
+# Test
+ss_class_dataframe_test = read_feather("datasets/ss_dataset_df/ss_class_dataframe_test.feather") 
+```
+
+## Fila {.sidebar}
+**¿Qué datos mostramos?**
+```{r}
+numericInput("num_rows_ss", "Número de filas a mostrar:", value = 10, min = 1, max = nrow(ss_class_dataframe_train))
+
+checkboxGroupInput("class_filter_ss", "Filtrar por clase:",
+                   choices = classes_ss)
+
+selectInput("dataset_filter_ss", "Filtrar por Dataset:", 
+            choices = c("Entrenamiento", "Validación", "Test"))
+```
+
+## Fila
+### Listado de Imágenes
+```{r}
+renderDT({
+  # Selecciamos los datos según
+  if (input$dataset_filter_od == "Entrenamiento") {
+      data = ss_class_dataframe_train
+  } else {
+    if (input$dataset_filter_od == "Validación") {
+        data = ss_class_dataframe_val
+    } else {
+        data = ss_class_dataframe_test
+    }
+  }
+  
+
+  # Filtramos las que contengan todas las clases seleccionadas
+  if (length(input$class_filter_ss) > 0) {
+    data = data %>%
+      filter(if_all(all_of(input$class_filter_ss)))
+  }
+
+  # Limitamos las filas
+  if (is.na(input$num_rows_ss)) {
+    n_rows = 0
+  } else {
+    n_rows = input$num_rows_ss
+  }
+  
+  data = data %>%
+    select(image) %>%
+    slice_head(n = n_rows)
+
+  # Mostramos la tabla
+  datatable(
+    data,
+    options = list(
+      dom = 't',
+      pageLength = n_rows
+    ),
+    rownames = FALSE
+  )
+})
+```
+
+# Análisis Exploratorio de Datos {data-navmenu="Segmentación Semántica"}
+## Fila {.sidebar}
+**¿Sobre qué datos mostramos estadísticas?**
+```{r}
+selectInput("eda_ss_data", "Subconjunto:", choices = c("Entrenamiento" = "train",
+                                                       "Validación" = "val", 
+                                                       "Test" = "test"))
+```
+
+## Fila
+### Gráficas
+```{r}
+imageOutput("eda_ss_plot")
+```
+
+```{r}
+output$eda_ss_plot = renderImage({
+  
+  file = str_c("plots/ss_", input$eda_ss_data, ".png")
+  
+  # Devolvemos la lista para renderImage
+  list(src = file,
+    contentType = "image/png",
+    width = 900,
+    style = "display: block; margin-left: auto; margin-right: auto;"
+  )
+}, deleteFile = FALSE)
+```
+
+# Predicción {data-navmenu="Segmentación Semántica"}
+## Fila {.sidebar}
+Introduce una foto y segmentamos las unidades en ella:
+```{r}
+fileInput("image_upload_ss", "Sube una imagen:", accept = c('image/png', 'image/jpeg'))
+actionButton("predict_btn_ss", "Segmentar imagen")
+```
+
+```{r}
+div(
+  style = "text-align: center; margin-top: 20px;",
+  tags$img(
+    src    = "plots/ss_legend.png",
+    alt    = "Leyenda de segmentación",
+    style  = "display: block; margin: 0 auto; width: 100%;"
+  )
+) 
+```
+
+## Fila
+
+### Visualización
+
+```{r}
+output$preview_img_ss = renderImage({
+  req(input$image_upload_ss)
+  list(
+    src = input$image_upload_ss$datapath,
+    contentType = input$image_upload_ss$type, 
+    alt = "Imagen subida",
+    style= "display: block; margin: 0 auto; width: 100%;"
+  )
+}, deleteFile = FALSE)
+```
+
+```{r}
+imageOutput("preview_img_ss", width="auto", height="auto")
+```
+
+### Predicción
+
+```{r}
+# Flag para saber si ya se ha segmentado
+seg_done = reactiveVal(FALSE)
+```
+
+```{r}
+# Vigilamos is se ha hecho la segmentacion
+observeEvent(input$predict_btn_ss, {
+  req(input$image_upload_ss)
+  seg_done(TRUE)
+})
+
+# Al cambiar la imagen reseteamos la segmentacion
+observeEvent(input$image_upload_ss, {
+  seg_done(FALSE)
+})
+```
+
+```{r}
+imageOutput("mask_img_ss")
+```
+
+```{r}
+output$mask_img_ss = renderImage({
+  # Solo hacemos algo si la imagen esta subida
+  req(input$image_upload_ss)
+  
+  # Continua si ya hemos pulsado Segmentar Imagen
+  req(seg_done())
+  
+  # El camino de la imagen
+  infile = input$image_upload_ss$datapath
+  tmp = tempfile(fileext = ".png")
+  
+  # Llamada a la funcion en Python
+  py$segment_unet(py$model_unet, infile, tmp)
+  
+  # Devuelve la mascara
+  list(
+    src = tmp,
+    contentType = "image/png",
+    alt = "Máscara segmentada",
+    style = "display: block; margin: 0 auto; width: 100%;"
+  ) 
+}, deleteFile = FALSE)
+```

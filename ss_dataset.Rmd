@@ -1,0 +1,465 @@
+---
+title: "Limpieza del Dataset de Segmentación Semántica"
+author: "Teodoro Alcántara Dormido"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Librerías
+```{r message=FALSE, warning=FALSE}
+library(arrow)
+library(dplyr)
+library(fs)
+library(magick)
+library(magrittr)
+library(purrr)
+library(readr)
+library(stringr)
+```
+
+## Funciones Auxiliares
+```{r}
+is_valid = function(image, mask){
+  # Verifica que un par imagen-mascara sea valido
+  
+  # Leemos la imagen y la mascara como tensores
+  image_tensor = image_data(image)
+  mask_tensor = image_data(mask)
+  
+  # Calculamos su simension
+  image_dim = dim(image_tensor)
+  mask_dim = dim(mask_tensor)
+  
+  # Inicializamos los posibles errores
+  errors = rep(FALSE, 3)
+  
+  # Verificamos que las dimensiones espaciales sean la misma y sea 640x640
+  if (image_dim[2] != mask_dim[2] || image_dim[3] != mask_dim[3] || 
+      image_dim[2] != 640 || image_dim[3] != 640) {
+    errors[1] = TRUE
+  }
+  
+  # Si la mascara esta en RGB, vemos que los tres canales sean iguales
+  if (mask_dim[1] != 1) {
+    R = as.integer(mask_tensor[1, , ])
+    G = as.integer(mask_tensor[2, , ])
+    B = as.integer(mask_tensor[3, , ])
+    
+    if (R != G || G != B || B != R) {
+      errors[2] = TRUE
+    }
+  }
+  
+  # Vemos que las clases tengan valores correctos (al menos en el primer canal)
+  image_classes = unique(as.integer(mask_tensor[1, , ]))
+  
+  if (!(all(image_classes %in% classes$`Pixel Value`))) {
+    errors[3] = TRUE
+  }
+  
+  # Vemos si el par es correcto
+  corrupt_pair = any(errors)
+  
+  return(list(corrupt_pair = corrupt_pair, errors = errors))
+}
+
+check_pairs = function(pairs_path) {
+  # Chequea todos los pares imagen-mascara de un directorio para ver si estan
+  # corruptos
+  
+  # Inicializamos nuestro dataframe de pares corruptos
+  pairs_df = tibble(
+    filename = character(),
+    `Shapes don't match` = logical(),
+    `Mask channels don't match` = logical(),
+    `Incorrect mask pixels` = logical(), 
+  )
+  
+  # Obtenemos los archivos del directorio y las imagenes de ellos
+  files = list.files(pairs_path)
+  image_files = str_subset(files, ".jpg$")
+  
+  # Inicializamos la barra de carga
+  pb = txtProgressBar(min = 1, max = length(image_files), initial = 1) 
+  it = 0
+  
+  for (image_file in image_files) {
+    
+    # Obtenemos el nombre sin extension y la mascara de la imagen
+    filename = str_remove(image_file, "\\.jpg$")
+    mask_file = str_c(filename, "_mask.png")
+    
+    # Leemos el par imagen-mascara
+    image = image_read(str_c(pairs_path, image_file))
+    mask = image_read(str_c(pairs_path, mask_file))
+    
+    # Obtenemos el diagnostico
+    pair_diagnostic = is_valid(image, mask)
+    
+    # Si el par es incorrecto, lo metemos en el dataframe
+    if (pair_diagnostic$corrupt_pair) {
+      errors = pair_diagnostic$errors 
+      pairs_df = pairs_df %>%
+        add_row(
+          filename = filename,
+          `Shapes don't match` = errors[1],
+          `Mask channels don't match` = errors[2],
+          `Incorrect mask pixels` = errors[3],
+        )
+    }
+    
+    # Actualizamos la barra de carga
+    it = it + 1
+    setTxtProgressBar(pb, it)
+    
+  }
+  
+  # Cerramos la barra de carga
+  close(pb)
+  
+  # Imprimimos las estadisticas encontradas por pantalla
+  n_corrupt = nrow(pairs_df)
+  n_pairs = length(image_files)
+  
+  print(str_c(" - Numero de Anotaciones Corruptas: ", n_corrupt, " de ", n_pairs))
+  print(str_c(" - Las dimensiones son incorrectas: ", sum(pairs_df$`Shapes don't match`)))
+  print(str_c(" - Los canales de las máscaras no casan: ", sum(pairs_df$`Mask channels don't match`)))
+  print(str_c(" - Píxeles de la máscara incorrectos: ", sum(pairs_df$`Incorrect mask pixels`)))
+  
+  return(pairs_df)
+}
+
+get_classes_corrupt_data = function(corrupt_data, masks_path) {
+  # Obtiene las clases de las mascaras pertenenciente a los pares corruptos
+  
+  # Inicializamos las clases
+  total_classes = c()
+  
+  # Inicializamos la barra de carga
+  pb = txtProgressBar(min = 1, max = nrow(corrupt_data), initial = 1) 
+  it = 0
+
+  # Para cada par, extraemos sus clases y las registramos
+  for (filename in corrupt_data$filename) {
+    mask_name = str_c(filename, "_mask.png")
+    mask = image_read(str_c(masks_path, mask_name))
+    mask_tensor = as.integer(image_data(mask))
+    mask_classes = unique(mask_tensor[1, , ])
+    
+    total_classes = union(total_classes, mask_classes)
+    
+    # Actualizamos la barra de carga
+    it = it + 1
+    setTxtProgressBar(pb, it)
+  }
+  
+  # Cerramos la barra de carga
+  close(pb)
+  
+  return(total_classes)
+}
+
+fix_corrupt_negative_pairs = function(corrupt_data, files_path) {
+  # Redimensiona los pares imagen-mascara corruptos correspondientes imagenes
+  # negativas
+  
+  # Inicializamos la barra de carga
+  pb = txtProgressBar(min = 1, max = nrow(corrupt_data), initial = 1) 
+  it = 0
+  
+  for (filename in corrupt_data$filename) {
+    
+    # Leemos el par imagen-mascara
+    img_path = str_c(files_path, filename, ".jpg")
+    mask_path = str_c(files_path, filename, "_mask.png")
+  
+    img  = image_read(img_path)    
+    mask = image_read(mask_path)   
+
+    # Redimensionamos el par sin tener en cuenta el aspect ratio (con !)
+    img_resized  = image_resize(img, "640x640!")
+    mask_resized = image_resize(mask, "640x640!")
+
+    # Sobreescribimos el par en el directorio
+    image_write(img_resized, img_path, format = "jpg")
+    image_write(mask_resized, mask_path, format = "png")
+    
+    # Acutalizamos la barra de carga
+    it = it + 1
+    setTxtProgressBar(pb, it)
+  }
+  
+  # Cerramos la barra de carga
+  close(pb)
+  
+  print(str_c("Imágenes negativas de ", files_path, " arregladas."))
+}
+
+files_path = "datasets/ss_dataset/train/"
+
+get_class_dataframe = function(files_path) {
+  # Obtiene un dataframe donde, para cada foto, tenemos una columna indicando si
+  # posee una determinada clase o no.
+  
+  # Inicializamos el dataframe con las imagenes y las clases:
+  images_df = tibble(
+    image = character(),
+    background = logical(),	
+    RU_airforce	= logical(),	
+    RU_army	= logical(),
+    RU_marines = logical(),		
+    RU_navy = logical(),	
+    US_airforce = logical(),
+    US_army = logical(),
+    US_marines = logical(),
+    US_navy = logical()
+  )
+  
+  # Leemos las mascaras
+  mask_files = str_subset(list.files(files_path), "_mask.png$")
+
+  # Inicializamos la barra de carga
+  pb = txtProgressBar(min = 1, max = length(mask_files), initial = 1) 
+  it = 0
+  
+  for (mask_file in mask_files) {
+    # Inicializamos el vector de clases de la mascara
+    image_classes_vect = rep(FALSE, 9)
+
+    # Leemos la mascara
+    mask_path = str_c(files_path, mask_file)
+    mask_tensor = image_data(image_read(mask_path))
+    
+    # Leemos las clases de la mascara
+    image_classes = unique(as.integer(mask_tensor[1, , ]))
+    
+    # Modificamos el vector booleano de clases
+    image_classes_vect[image_classes + 1] = TRUE
+    
+    # Actualizamos el Dataframe
+    images_df = images_df %>%
+        add_row(
+          image = str_c(str_remove(mask_file, "_mask.png$"), ".jpg"),
+          background = image_classes_vect[1],	
+          RU_airforce	= image_classes_vect[2],	
+          RU_army	= image_classes_vect[3],
+          RU_marines = image_classes_vect[4],		
+          RU_navy = image_classes_vect[5],	
+          US_airforce = image_classes_vect[6],
+          US_army = image_classes_vect[7],
+          US_marines = image_classes_vect[8],
+          US_navy = image_classes_vect[9]
+        )
+    
+    # Acutalizamos la barra de carga
+    it = it + 1
+    setTxtProgressBar(pb, it)
+  }
+  
+  # Cerramos la barra de carga
+  close(pb)
+  
+  return(images_df)
+}
+```
+
+
+## Validación de Datos
+Comenzamos verificando que todas las imágenes estén en JPG o PNG, como se supone que debe ser.
+```{r}
+# Archivos de cada subconjunto
+train_files = list.files("datasets/ss_dataset/train", full.names = FALSE)
+val_files = list.files("datasets/ss_dataset/val", full.names = FALSE)
+test_files = list.files("datasets/ss_dataset/test", full.names = FALSE)
+
+# Los archivos no JPG y no PNG de cada subconjunto
+train_files %>%
+  tibble(file = .) %>%
+  filter(!(str_ends(file, ".jpg")) & !(str_ends(file, ".png"))) %>%
+  print()
+val_files %>%
+  tibble(file = .) %>%
+  filter(!(str_ends(file, ".jpg")) & !(str_ends(file, ".png"))) %>%
+  print()
+test_files %>%
+  tibble(file = .) %>%
+  filter(!(str_ends(file, ".jpg")) & !(str_ends(file, ".png"))) %>%
+  print()
+```
+Vemos que en cada subconjunto hay un fichero llamado img_02177.csv. Este debe haber sido confundido con una imagen durante el preprocesamiento anterior y contiene las clases:
+
+```{r}
+classes = read_csv("datasets/ss_dataset/train/img_02177.csv",
+                   col_types = cols(
+                     `Pixel Value` = col_integer(),
+                     Class = col_factor()
+                   ))
+classes
+```
+
+Según vemos, todas las imágenes están en JPG y todas las máscaras están en png y llevan el sufijo "_mask". Vamos que esto sea así. Para ello, extraemos todas imágenes en JPG y todas las imágenes en PNG acabadas en _mask para cada subconjunto. Comprobamos que haya el mismo número de presuntas imágenes y de presuntas máscaras en cada subconjunto y que estas suman el total del subconjunto (sin contar el fichero con las anotaciones). Despues, vemos que, en efecto, a cada imagen corresponde una máscara y a cada máscara una imagen. Para ello reparamos en que la máscara de cada imagen tendrá el nombre de la imagen y el sufijo _mask.
+```{r}
+# Presuntas imagenes y mascaras de cada subconjunto
+train_images = str_subset(train_files, ".jpg$")
+train_masks = str_subset(train_files, "_mask.png$")
+val_images = str_subset(val_files, ".jpg$")
+val_masks = str_subset(val_files, "_mask.png$")
+test_images = str_subset(test_files, ".jpg$")
+test_masks = str_subset(test_files, "_mask.png$")
+
+# Numero de imagenes y mascaras en cada subconjunto
+n_train_images = length(train_images)
+n_train_masks = length(train_masks)
+n_val_images = length(val_images) 
+n_val_masks = length(val_masks)
+n_test_images = length(test_images)
+n_test_masks = length(test_masks)
+
+if (n_train_images == n_train_masks) {
+  print("Mismo número de máscaras que de imágenes en entrenamiento.")
+}
+if (n_val_images == n_val_masks) {
+  print("Mismo número de máscaras que de imágenes en validación.")
+}
+if (n_test_images == n_test_masks) {
+  print("Mismo número de máscaras que de imágenes en test.")
+}
+
+if ((n_train_images + n_train_masks + 1) == length(train_files)) {
+  print("Las imágenes y máscaras encontradas conforman todo el conjunto de entrenamiento.")
+}
+if ((n_val_images + n_val_masks + 1) == length(val_files)) {
+  print("Las imágenes y máscaras encontradas conforman todo el conjunto de validación.")
+}
+if ((n_test_images + n_test_masks + 1) == length(test_files)) {
+  print("Las imágenes y máscaras encontradas conforman todo el conjunto test.")
+}
+```
+
+Los números suman. Ahora veamos la correspondencia:
+```{r}
+# Para el conjunto de entrenamiento 
+equal_train = tibble(train_images, train_masks) %>%
+  mutate( # Obtenemos las imagenes sin extension ni sufijo, solo los nombres
+    image_name = sort(str_remove(train_images, "\\.jpg$")),
+    mask_name = sort(str_remove(train_masks, "\\_mask.png$"))
+  ) %$%
+  map2_lgl( # Ordenadas, si hay correspondencia, ambas columnas son iguales
+    .x = image_name,
+    .y = mask_name,
+    \(x, y) x == y
+  ) %>%
+  all()
+
+# Para el conjunto de validacion
+equal_val = tibble(val_images, val_masks) %>%
+  mutate( # Obtenemos las imagenes sin extension ni sufijo, solo los nombres
+    image_name = sort(str_remove(val_images, "\\.jpg$")),
+    mask_name = sort(str_remove(val_masks, "\\_mask.png$"))
+  ) %$%
+  map2_lgl( # Ordenadas, si hay correspondencia, ambas columnas son iguales
+    .x = image_name,
+    .y = mask_name,
+    \(x, y) x == y
+  ) %>%
+  all()
+
+# Para el conjunto test
+equal_test = tibble(test_images, test_masks) %>%
+  mutate( # Obtenemos las imagenes sin extension ni sufijo, solo los nombres
+    image_name = sort(str_remove(test_images, "\\.jpg$")),
+    mask_name = sort(str_remove(test_masks, "\\_mask.png$"))
+  ) %$% # Ordenadas, si hay correspondencia, ambas columnas son iguales
+  map2_lgl(
+    .x = image_name,
+    .y = mask_name,
+    \(x, y) x == y
+  ) %>%
+  all()
+
+if (equal_train) {
+  print("En entrenamiento, hay una imagen para cada máscara y una máscara para cada imagen.")
+} else {
+  print("En entrenamiento, imagenes y máscaras no coinciden.")
+}
+
+if (equal_val) {
+  print("En validación, hay una imagen para cada máscara y una máscara para cada imagen.")
+} else {
+  print("En validación, imagenes y máscaras no coinciden.")
+}
+
+if (equal_test) {
+  print("En test, hay una imagen para cada máscara y una máscara para cada imagen.")
+} else {
+  print("En test, imagenes y máscaras no coinciden.")
+}
+```
+
+Ahora que sabemos que el dataset está compuesto enteramente por pares imagen-mascara, veamos cuales de ellos presentan problemas:
+```{r}
+corrupt_data_train = check_pairs("datasets/ss_dataset/train/")
+corrupt_data_val = check_pairs("datasets/ss_dataset/val/")
+corrupt_data_test = check_pairs("datasets/ss_dataset/test/")
+```
+
+
+Tras observar directamente en el conjunto de datos que estos parecen ser imagenes negativas (con todo fondo), vemos, de forma sistemática, si esto, en efecto, es así:
+```{r}
+train_classes = get_classes_corrupt_data(corrupt_data_train, 
+                                         "datasets/ss_dataset/train/")
+val_classes = get_classes_corrupt_data(corrupt_data_val, 
+                                       "datasets/ss_dataset/val/")
+test_classes = get_classes_corrupt_data(corrupt_data_test, 
+                                        "datasets/ss_dataset/test/")
+
+print(str_c("- Clases de los pares corruptos en entrenamiento: ", 
+            train_classes))
+print(str_c("- Clases de los pares corruptos en validación: ", val_classes))
+print(str_c("- Clases de los pares corruptos en test: ", test_classes))
+```
+
+Como parece ser así, no hay problema en redimensionar las imágenes y máscaras para que estén en el mismo tamaño. Las redimensionamos al tamaño en que deben estar todas las imágenes de los datos, $640 \times 640$. Creamos un dataset ya limpio con estas imágenes.
+
+```{r}
+# Creamos el dataset limpio
+dir_copy("datasets/ss_dataset", "datasets/ss_dataset_clean")
+
+# Redimensionamos las imagenes
+fix_corrupt_negative_pairs(corrupt_data_train, "datasets/ss_dataset_clean/train/")
+fix_corrupt_negative_pairs(corrupt_data_val, "datasets/ss_dataset_clean/val/")
+fix_corrupt_negative_pairs(corrupt_data_test, "datasets/ss_dataset_clean/test/")
+```
+
+## Obtención de un Dataframe con las Imágenes y las Clases de sus Píxeles
+Creamos un dataframe donde se nos indique, en cada columna, si esa imagen contiene pixeles de la clase asociada a la columna o no:
+```{r}
+ss_class_dataframe_train = get_class_dataframe("datasets/ss_dataset_clean/train/")
+ss_class_dataframe_val = get_class_dataframe("datasets/ss_dataset_clean/val/")
+ss_class_dataframe_test = get_class_dataframe("datasets/ss_dataset_clean/test/")
+```
+
+Creamos el directorio para guardar los datframes creados:
+```{r}
+dir_create("datasets/ss_dataset_df")
+```
+
+Guardamos como feather:
+```{r}
+write_feather(
+  ss_class_dataframe_train,
+  "datasets/ss_dataset_df/ss_class_dataframe_train.feather"
+)
+write_feather(
+  ss_class_dataframe_val,
+  "datasets/ss_dataset_df/ss_class_dataframe_val.feather"
+)
+write_feather(
+  ss_class_dataframe_test,
+  "datasets/ss_dataset_df/ss_class_dataframe_test.feather"
+)
+```
+
