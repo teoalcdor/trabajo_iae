@@ -16,7 +16,7 @@ trabajo_iae/
 │  ├─ ss_dataset_clean/  
 │  ├─ ss_dataset_df/  
 │  ├─ classification_dataset_augmented.zip  
-│  ├─ od_dataset  
+│  ├─ od_dataset/  
 │  ├─ od_dataset.yaml  
 │  ├─ od_dataset_clean.zip  
 ├─ envs/  
@@ -48,7 +48,7 @@ ss_dataset.Rmd
 ss_models.ipynb  
 trabajo_iae.Rproj  
   
-De esta forma, podrán ejecutarse todos los ficheros .Rmd sin problema alguno. Estos serán los encargados de la limpieza del *dataset* y el *dashboard*. En cuanto a los ipynb, mientras que plot.ipynb es recomendable correrlo localmente, el resto están adaptados para hacerlo en Google Colab. Estos últimos, que se encargan de la modelización, están adaptados mediante un botón para ser abiertos en la plataforma gratuita ofrecida por Google y conectarse a Google Drive para acceder a los archivos .zip de la carpeta datasets.
+Donde las carpetas de los *datasets* contienen los datos pertinentes y la de plots las gráficas necesarias, que no ponemos por brevedad. De esta forma, podrán ejecutarse todos los ficheros .Rmd sin problema alguno. Estos serán los encargados de la limpieza del *dataset* y el *dashboard*. En cuanto a los ipynb, mientras que plot.ipynb es recomendable correrlo localmente, el resto están adaptados para hacerlo en Google Colab. Estos últimos, que se encargan de la modelización, están adaptados mediante un botón para ser abiertos en la plataforma gratuita ofrecida por Google y conectarse a Google Drive para acceder a los archivos .zip de la carpeta datasets.
 
 ## Obtener el Trabajo
 Podemos encontrar todo el trabajo, con esta estructura en Google Drive, clicando [aquí](https://drive.google.com/drive/folders/1gwd3M8vxaypgw2bO3Bdj91rj349LIYf1?usp=sharing){:target="_blank"}
