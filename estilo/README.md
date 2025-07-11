@@ -1,5 +1,7 @@
 # 📘 Manual - Conector IDS 📘
-Vamos a usar la implementación que podemos encontrar en [este](https://github.com/International-Data-Spaces-Association/DataspaceConnector) repositorio de GitHub. La principal ventaja de esta es su amplia documentación, tanto del conector en sí como de conceptos relacionados con los Espacios de Datos. A este respecto, se recomienda leer su [documentación](https://international-data-spaces-association.github.io/DataspaceConnector/). Su mayor defecto es que, desde el 2023, no está activamente mantenido, aunque se busca nuevo personal que lo mantenga.
+Vamos a usar la implementación que podemos encontrar en [este](https://github.com/International-Data-Spaces-Association/DataspaceConnector) repositorio de GitHub. La principal ventaja de esta es su amplia documentación, tanto del conector en sí como de conceptos relacionados con los Espacios de Datos. A este respecto, se recomienda leer su [documentación](https://international-data-spaces-association.github.io/DataspaceConnector/). Su mayor defecto es que, desde el 2023, no está activamente mantenido, aunque se busca nuevo personal que lo mantenga.  
+
+Se ofrecen `prueba_ejemplo.txt`, donde se puede ver un ejemplo de las llamadas a la API que hay que realizar y `prueba_ejecutable.sh`, que permite, uan vez hecho el despliegue en el puerto 8080 como se muestra más abajo, ejecutar un ejemplo que nos haga toda la parte de compartir datos, de forma que solo reste explorar el catálogo y negociar el contrato. Se puede personalizar el ejemplo cambiando, por ejemplo, el enlace de los datos para hacer, si corresponde, un ejemplo más complicado en el que se compartan datos desde otras fuentes.
 
 ## 🚀 Despliegue
 Para el despliegue hay dos opciones principalmente. O bien podemos simplemente hacer:
@@ -67,13 +69,13 @@ Siguiendo esto, vamos creando y enlazando las distintas entidades hasta completa
 * Añadimos el contrato al recurso ofrecido
 * Añadimos las reglas al contrato
 
-Debemos tener en cuenta que para que un recurso que ofrecemos se considere completo y pueda ser listado en el catálogo, ha de tener una representación con, al menos, un artefacto y un contrato con, al menos una regla. Haremos incapié en añadir datos al artefacto y en las reglas, por ser de especial importancia y algo diferentes a lo ya visto.
+Debemos tener en cuenta que para que un recurso que ofrecemos se considere completo y pueda ser listado en el catálogo, ha de tener una representación con, al menos, un artefacto y un contrato con, al menos una regla. Haremos incapié en añadir datos al artefacto y en las reglas, por ser de especial importancia y algo diferentes a lo ya visto. Sí adevertimos de que **si no estamos dentro de las fechas de inicio y fin de un contrato, al negociar el contrato nos saltará un error 417 por no encontrarlo**.
 
 #### 📦 Artifact + Datos
 Una vez creado el artefacto mediante `POST /api/artifacts` habrá que añadirle datos. A diferencia de lo que se dice en la documentación, no podemos añadir los datos en le cuerpo de `POST /api/artifacts/{id}/data`. En su lugar lo hacemos mediante una petición de tipo PUT, con `PUT /api/artifacts/{id}/data`. Subiemos a ella los datos a aportar. Si se quisiese retribuir datos de una base de datos PostgreSQL, creemos que se puede hacer mediante el uso del atributo `accessURL` de los datos del artefacto. Este se explica [aquí](https://international-data-spaces-association.github.io/DataspaceConnector/CommunicationGuide/v6/Provider), en Add Data.
 
 #### 📜 Rules + Usage Policies
-Se crean con `POST /api/rules`. En el atributo `value` debe hubicarse la política de uso. Esto se indica [aquí](https://international-data-spaces-association.github.io/DataspaceConnector/CommunicationGuide/v6/Provider), sin embargo, no se especifica cómo han de enlazarse estas políticas. Como es difícil crear una política de este estilo, existe una herramienta que las crea dentro de la API. Su uso se especifica [aquí](https://international-data-spaces-association.github.io/DataspaceConnector/Documentation/v6/UsageControl#example-endpoint). El cómo asignar la regla al valor no queda del todo claro, pero en la sección sobre ejemplos de despliegues se puede ver algo más al respecto.
+Se crean con `POST /api/rules`. En el atributo `value` debe hubicarse la política de uso. Esto se indica [aquí](https://international-data-spaces-association.github.io/DataspaceConnector/CommunicationGuide/v6/Provider), sin embargo, no se especifica cómo han de enlazarse estas políticas. Como es difícil crear una política de este estilo, existe una herramienta que las crea dentro de la API. Su uso se especifica [aquí](https://international-data-spaces-association.github.io/DataspaceConnector/Documentation/v6/UsageControl#example-endpoint). Para asignar la regla a `value` bastará con copiar la relga, escaparla (especialmente las ") y poner como valor el JSON de la regla como cadena escapada.
 
 ### 📥 Obtención de Datos
 Para esta sección nos basamos en [esta sección](https://international-data-spaces-association.github.io/DataspaceConnector/CommunicationGuide/v6/Consumer). 
@@ -82,13 +84,23 @@ Para esta sección nos basamos en [esta sección](https://international-data-spa
 Para consultar los catálogos, nos vamos a `POST /api/ids/description`, dentro del apartado _Messaging e introuducimos, en `recipient`, https://localhost:8080/api/ids/data y no ponemos nada como id del recurso. Así consultamos el conector y vemos los catálogos. Para ver qué recursos están listados en cada catálogo, volvemos a hacer lo mismo, pero poniendo como id del recurso la **ruta completa** del catálogo. Por alguna razón, al seguir los pasos del tutorial no es posible ver listado el recurso en el catálogo. Puede deberse a la asignacion de la política de acceso en el contrato.
 
 #### 📡Tramitación del Intercambio de Datos
-🛠️ (WIP)
+Habrá que poner todo el contenido de `ids:permission`, que encontramos dentro de `ids:contractOffer` para el recurso con el que estemos trabajando. Hay que añadir a este contenido el atributo `"ids:target": "https://localhost:8080/api/artifacts/<id del artifact>"`. Así, un ejemplo de cuerpo de una petición de este tipo sería:
+```commandline
+[
+  {
+    "@type": "ids:Permission",
+    "@id": "https://localhost:8080/api/rules/29689e21-99ea-4507-93bf-b7e201d932fd",
+    "ids:target": "https://localhost:8080/api/artifacts/d6d2b509-545d-481b-83d3-e6d678171292"
+  }
+]
+```
+Ahora, podremos acceder al artefacto del recurso, a partir del cual podremos obtener sus datos mediante la dirección que proporciona para ello.
 
 ## 🧪 Ejemplos de Despliegues
 En [este](https://github.com/International-Data-Spaces-Association/IDS-Deployment-Examples) repositorio encontramos ejemplos de despliegue de este conector IDS, a parte de los correspondientes a otros componentes de los Espacios de Datos. 
 
 ### 🌐 provider-consumer
-Es de especial interés el ejemplo `provider-consumer` dentro de la carpeta `dataspace connector`. En él se trata de hacer una prueba en la cual un conector IDS en el puerto 8081 provee datos a otro en el puerto 8080. Por desgracia, aunque en este ejemplo sí se crea una oferta de un recurso que se lista en el catálogo, por lo que puede verse en qué se estaba fallando al construirse el catálogo y oferta descritos en los pasos anteriores, no es posible negociar el contrato. Esto ocurre porque lo que aparece al listar el recurso no es similar a lo que aparece en la [documentación](https://international-data-spaces-association.github.io/DataspaceConnector/CommunicationGuide/v6/Consumer) en cuanto a información de la oferta de contrato y al poner en `/api/ids/contract` la información pertinente, la respuesta es 417, no encontrando una oferta de contrato.
+Es de especial interés el ejemplo `provider-consumer` dentro de la carpeta `dataspace connector`. En él se trata de hacer una prueba en la cual un conector IDS en el puerto 8081 provee datos a otro en el puerto 8080. Por desgracia, aunque en este ejemplo sí se crea una oferta de un recurso que se lista en el catálogo, no es posible negociar el contrato como pone en la guía. Esto ocurre porque la fecha de finalización del contrato es de mayo del 2025, por lo que habrá que cambiar esto manualmente en el fichero .sh.
 
 ### 🗃️ Ejemplos con BD PostgreSQL
 Los otros dos ejemplos de conector implementan un conector IDS que guarda *logs* y metadatos de recursos, artefactos, etc. en una base de datos PostgreSQL. Destacamos que, como se indica más abajo, si lo que se quiere es servir el los datos de una base de datos a través de un conector, tal vez el mejor modo de hacerlo sea haciendo uso del atributo `accessURL` de los datos del artefacto. Señalamos en el ejemplo más completo, `full`, el uso de una UI desarrollada por el mismo equipo que hizo el conector y que puede ser útil para realizar más cómodamente la creación de recursos o la negociación de contratos.
